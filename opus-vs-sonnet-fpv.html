@@ -1,0 +1,1861 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rainbow Run FPV — Opus 5.5 Max vs Sonnet 5.5 Max</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #screen { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; display: block;
+            image-rendering: crisp-edges; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+"use strict";
+(() => {
+/* =========================================================================
+   RAINBOW RUN — GÓC NHÌN THỨ NHẤT
+   Camera = đôi mắt của OPUS 5.5 MAX, đua solo với SONNET 5.5 MAX trên sàn
+   cầu vồng giữa vũ trụ. Canvas logic 160x90, bảng màu cố định 32 màu, mọi
+   pixel đều ghi vào framebuffer chỉ số màu rồi mới phóng to nguyên lần.
+   Mô phỏng bước cố định 60Hz, vẽ bằng rAF, vòng lặp tất định (không random).
+   ========================================================================= */
+
+// ---------------------------------------------------------------- constants
+const W = 160, H = 90, NPX = W * H, TPS = 60;
+const F = 50;          // focal length: px per cell at depth 1 (main view)
+const FM = 10;         // focal length of the rear-view mirror
+const SEG = 2;         // road segment length (cells)
+const NSEG = 170;      // road draw distance (segments)
+const HALFW = 14;      // road half width (cells)
+const EYE = 6.5;       // eye height of the 12x8 character (cells)
+const NEAR = 0.9;      // near plane
+const HORIZON = 39;    // base horizon row
+const ZINF = 1e9;
+const sec = (s) => Math.round(s * TPS);
+
+// ------------------------------------------------------------ palette (32)
+const BLK = 0, NV0 = 1, NV1 = 2, NV2 = 3, PU0 = 4, PU1 = 5,
+      OPH = 6, OPB = 7, OPS = 8, SNH = 9, SNB = 10, SNS = 11,
+      RED = 12, REDD = 13, ORG = 14, ORGD = 15, YEL = 16, YELD = 17,
+      GRN = 18, GRND = 19, CYA = 20, CYAD = 21, BLU = 22, BLUD = 23,
+      VIO = 24, VIOD = 25, RKD = 26, RKM = 27, RKL = 28, WHT = 29, MAG = 30, STR = 31;
+const PAL_HEX = [
+  0x000000, 0x080a1c, 0x111640, 0x1d2466, 0x2b1450, 0x4c2178, // deep space
+  0xf3b393, 0xcd7b5e, 0x8a4433,                               // Opus: hi / body / shadow
+  0xf2a3bb, 0xc8637f, 0x7a2b49,                               // Sonnet: hi / body / shadow
+  0xff3b4f, 0x9b1636, 0xff9020, 0xa34a10, 0xffe23a, 0xa88a10, // rainbow + dark
+  0x3fdf5a, 0x167a38, 0x38d6ff, 0x14709c, 0x3c5cff, 0x1b2a96,
+  0xb04cff, 0x571d92,
+  0x2e2226, 0x6b4e45, 0xa58471,                               // rock dark / mid / light
+  0xffffff, 0xff40cf, 0xa8b6e0                                // white, magenta, star
+];
+const LANE = new Uint8Array([RED, ORG, YEL, GRN, CYA, BLU, VIO]);
+const LANED = new Uint8Array([REDD, ORGD, YELD, GRND, CYAD, BLUD, VIOD]);
+const BAYER = new Uint8Array([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]);
+
+const pal32 = new Uint32Array(32);
+{
+  const le = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+  for (let i = 0; i < 32; i++) {
+    const h = PAL_HEX[i], r = (h >> 16) & 255, g = (h >> 8) & 255, b = h & 255;
+    pal32[i] = le ? ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0
+                  : ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0;
+  }
+}
+
+// ------------------------------------------- deterministic tables (init only)
+let seedv = 0x2545F491;
+function rnd() {
+  seedv = (seedv + 0x6D2B79F5) | 0;
+  let t = seedv;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const RT = new Float32Array(1024);           // runtime "noise" table, read by index
+for (let i = 0; i < 1024; i++) RT[i] = rnd();
+let rtI = 0;
+function rr() { rtI = (rtI + 1) & 1023; return RT[rtI]; }
+
+// ------------------------------------------------------------------ 3x5 font
+const GL_W = new Uint8Array(128), GL_R = new Uint8Array(128 * 5);
+{
+  const src = {
+    A: "010101111101101", B: "110101110101110", C: "011100100100011", D: "110101101101110",
+    E: "111100110100111", F: "111100110100100", G: "011100101101011", H: "101101111101101",
+    I: "111010010010111", J: "001001001101010", K: "101101110101101", L: "100100100100111",
+    M: "1000111011101011000110001", N: "10011101101110011001", O: "010101101101010", P: "110101110100100",
+    Q: "010101101111011", R: "110101110101101", S: "011100010001110", T: "111010010010010",
+    U: "101101101101011", V: "101101101010010", W: "1000110001101011101110001", X: "101101010101101",
+    Y: "101101010010010", Z: "111001010100111",
+    "0": "011101101101110", "1": "010110010010111", "2": "110001010100111", "3": "110001010001110",
+    "4": "101101111001001", "5": "111100110001110", "6": "011100111101111", "7": "111001010100100",
+    "8": "111101111101111", "9": "111101111001110",
+    "%": "101001010100101", "-": "000000111000000", "+": "000010111010000", "/": "001001010100100",
+    ".": "00001", "!": "11101", ":": "01010", " ": ""
+  };
+  for (const ch in src) {
+    const s = src[ch], code = ch.charCodeAt(0);
+    if (s.length === 0) { GL_W[code] = 2; continue; }
+    const w = s.length / 5;
+    GL_W[code] = w;
+    for (let r = 0; r < 5; r++) {
+      let bits = 0;
+      for (let c = 0; c < w; c++) if (s[r * w + c] === "1") bits |= 1 << (w - 1 - c);
+      GL_R[code * 5 + r] = bits;
+    }
+  }
+}
+const STRS = ["OPUS 5.5 MAX", "SONNET 5.5 MAX", "1ST", "2ND", "GO!", "OVERTAKE!", "SONNET LEADS",
+  "NEAR MISS", "FINISH!", "WINNER", "30% FASTER", "BATCH TOOL CALLS", "FEWER STEPS",
+  "ADAPTIVE THINKING", "1M CONTEXT", "HALF THE TURNS", "MAX EFFORT", "JINOZ", "JUMP", "SLIDE",
+  "DASH", "RECALL"];
+const T_OPUS = 0, T_SONNET = 1, T_1ST = 2, T_2ND = 3, T_GO = 4, T_OVER = 5, T_SLEADS = 6,
+      T_NEAR = 7, T_FINISH = 8, T_WINNER = 9, T_FASTER = 10, T_BATCH = 11, T_FEWER = 12,
+      T_ADAPT = 13, T_CTX = 14, T_HALF = 15, T_MAXEFF = 16, T_JINOZ = 17, T_JUMP = 18,
+      T_SLIDE = 19, T_DASH = 20, T_RECALL = 21;
+const TXT = [], TXT_W = new Int16Array(STRS.length);
+for (let i = 0; i < STRS.length; i++) {
+  const s = STRS[i], a = new Uint8Array(s.length);
+  let w = 0;
+  for (let j = 0; j < s.length; j++) { a[j] = s.charCodeAt(j); w += GL_W[a[j]] + 1; }
+  TXT.push(a);
+  TXT_W[i] = w - 1;
+}
+
+// --------------------------------------------------------------- framebuffer
+const fb = new Uint8Array(NPX);       // palette indices
+const zb = new Float32Array(NPX);     // depth buffer for world objects
+let clipL = 0, clipT = 0, clipR = W - 1, clipB = H - 1, useZ = true;
+function setClip(l, t, r, b) { clipL = l; clipT = t; clipR = r; clipB = b; }
+function resetClip() { clipL = 0; clipT = 0; clipR = W - 1; clipB = H - 1; }
+
+function pset(x, y, c) {
+  if (x < clipL || x > clipR || y < clipT || y > clipB) return;
+  fb[y * W + x] = c;
+}
+function psetZ(x, y, c, z) {
+  if (x < clipL || x > clipR || y < clipT || y > clipB) return;
+  const i = y * W + x;
+  if (useZ) { if (z >= zb[i]) return; zb[i] = z; }
+  fb[i] = c;
+}
+function rectF(x, y, w, h, c) {
+  let x0 = x < clipL ? clipL : x, y0 = y < clipT ? clipT : y;
+  let x1 = x + w - 1, y1 = y + h - 1;
+  if (x1 > clipR) x1 = clipR;
+  if (y1 > clipB) y1 = clipB;
+  for (let yy = y0; yy <= y1; yy++) {
+    const o = yy * W;
+    for (let xx = x0; xx <= x1; xx++) fb[o + xx] = c;
+  }
+}
+function rectZ(x0, y0, x1, y1, c, z) {
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) psetZ(x, y, c, z);
+}
+function lineF(x0, y0, x1, y1, c) {               // Bresenham, integer endpoints
+  let dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, n = 0;
+  for (;;) {
+    pset(x0, y0, c);
+    if ((x0 === x1 && y0 === y1) || ++n > 400) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function lineZ(x0, y0, x1, y1, c, z) {
+  let dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, n = 0;
+  for (;;) {
+    psetZ(x0, y0, c, z);
+    if ((x0 === x1 && y0 === y1) || ++n > 400) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function circle(cx, cy, r, c, z) {                // midpoint circle (z < 0 → no depth test)
+  let x = r, y = 0, err = 1 - r;
+  while (x >= y) {
+    if (z < 0) {
+      pset(cx + x, cy + y, c); pset(cx + y, cy + x, c); pset(cx - y, cy + x, c); pset(cx - x, cy + y, c);
+      pset(cx - x, cy - y, c); pset(cx - y, cy - x, c); pset(cx + y, cy - x, c); pset(cx + x, cy - y, c);
+    } else {
+      psetZ(cx + x, cy + y, c, z); psetZ(cx + y, cy + x, c, z); psetZ(cx - y, cy + x, c, z); psetZ(cx - x, cy + y, c, z);
+      psetZ(cx - x, cy - y, c, z); psetZ(cx - y, cy - x, c, z); psetZ(cx + y, cy - x, c, z); psetZ(cx + x, cy - y, c, z);
+    }
+    y++;
+    if (err < 0) err += 2 * y + 1; else { x--; err += 2 * (y - x) + 1; }
+  }
+}
+function glyphs(id, x, y, col, sc, count) {
+  const s = TXT[id], n = count < s.length ? count : s.length;
+  let cx = x;
+  for (let i = 0; i < n; i++) {
+    const g = s[i], gw = GL_W[g];
+    for (let r = 0; r < 5; r++) {
+      const bits = GL_R[g * 5 + r];
+      if (bits === 0) continue;
+      for (let c = 0; c < gw; c++) {
+        if (bits & (1 << (gw - 1 - c))) {
+          if (sc === 1) pset(cx + c, y + r, col); else rectF(cx + c * sc, y + r * sc, sc, sc, col);
+        }
+      }
+    }
+    cx += (gw + 1) * sc;
+  }
+}
+function text(id, x, y, col, sc, oc, count) {     // oc < 0 → no outline
+  if (oc >= 0) {
+    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) if (ox | oy) glyphs(id, x + ox, y + oy, oc, sc, count);
+  }
+  glyphs(id, x, y, col, sc, count);
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function ease(type, u) {
+  if (u <= 0) return 0;
+  if (u >= 1) return 1;
+  if (type === 1) return u * u * (3 - 2 * u);
+  if (type === 2) { const v = 1 - u; return 1 - v * v * v; }
+  if (type === 3) return u * u * u;
+  return u;
+}
+
+// =========================================================================
+//  TIMELINE — every second of the race is choreographed (no randomness).
+//  Key frames: [seconds, value, ease-into-this-key]  (0 lin, 1 smooth, 2 out, 3 in)
+// =========================================================================
+const T_END = sec(49.2), NT = T_END + 4;
+
+const KF_SPEED = [0, 2.0, 0, 39.9, 2.0, 0, 41.1, 3.2, 1, 44.5, 3.2, 0, 45.6, 2.8, 1, 46.6, 2.8, 0,
+  48.5, 4.4, 3, 49.2, 4.4, 0];
+// Opus lateral position (camera x)
+const KF_XO = [0, -4, 0, 1.6, -4, 0, 2.6, -1, 1, 4.55, -1, 0, 4.69, -10, 2, 5.4, -10, 0, 6.4, -3, 1,
+  8.6, -3, 0, 9.3, 2, 1, 10.95, 2, 0, 11.09, -7, 2, 11.8, -7, 0, 12.5, -4, 1,
+  14.2, -4, 0, 15.0, -1, 1, 18.8, -1, 0, 19.25, -5, 1, 19.65, -5, 0, 20.15, 3, 1,
+  23.6, 3, 0, 24.2, -3, 1, 25.04, -3, 0, 25.16, -6, 2, 25.8, -6, 0, 25.92, -1, 2,
+  30.5, -1, 0, 31.5, 0, 1, 40.0, 0, 0, 40.6, -3, 1, 42.1, -3, 0, 42.24, -9, 2, 42.9, -9, 0,
+  43.9, 0, 1, 49.2, 0, 0];
+// Sonnet distance ahead of Opus (cells): >0 ahead (seen directly), <0 behind (mirror)
+const KF_GAP = [0, 9, 0, 1.4, 9, 0, 3.2, 30, 2, 8.4, 34, 1, 10.7, 34, 0, 11.2, 27, 2, 13.4, -8, 1,
+  16.4, -14, 1, 17.2, -14, 0, 18.6, 12, 1, 22.8, 12, 0, 24.4, 6.5, 2, 26.9, 6.5, 0, 28.7, 6, 1,
+  29.6, -8, 2, 31.6, -16, 1, 33.0, -16, 0, 35.7, -3, 1, 35.95, -3, 0, 37.1, 12, 1, 39.9, 12, 0,
+  40.9, -2, 1, 43.6, -40, 3, 44.5, -56, 1, 46.0, -72, 1, 49.2, -110, 1];
+// Sonnet lateral position
+const KF_XS = [0, 8, 0, 1.4, 8, 0, 2.6, 3, 1, 9.6, 4, 1, 10.75, 4, 0, 10.95, 9, 2, 11.6, 9, 0,
+  12.3, 7, 1, 14.5, 6, 1, 16.6, 5, 1, 17.4, 5, 0, 17.9, 2, 1, 18.8, 2, 0, 19.3, -4, 1, 19.7, -4, 0,
+  20.3, 2, 1, 22.4, 2, 0, 23.2, 7, 1, 24.94, 7, 0, 25.06, 4, 2, 25.8, 4, 0, 25.95, 9, 2,
+  28.95, 9, 0, 29.1, 10, 2, 30.0, 10, 0, 31.0, 5, 1, 35.0, 6, 1, 49.2, 6, 0];
+
+// actions: [type, start(s), ...]   type: J jump(h0,H,rise,fall) D dash(dir,ticks)
+// S slide(ticks)  Q double jump(H1,r1,hang,H2,r2,fall)  U surge(dur s)  L look-back(dur)  X stumble(dur)
+const ACT_O = [
+  ["D", 4.55, -1, 12],
+  ["J", 9.50, 0, 5.5, 18, 22],
+  ["S", 10.30, 30],
+  ["D", 10.95, -1, 12],
+  ["J", 14.70, 0, 3.6, 14, 17],
+  ["J", 17.00, 0, 5.5, 18, 22],
+  ["S", 22.55, 50],
+  ["Q", 28.62, 6, 17, 6, 8, 15, 33],
+  ["J", 35.90, 3, 13, 30, 39],
+  ["D", 42.10, -1, 12]
+];
+const ACT_S = [
+  ["U", 1.4, 1.2], ["L", 3.3, 0.7], ["X", 11.0, 1.1], ["J", 14.80, 0, 3.6, 14, 17],
+  ["J", 17.2, 0, 9, 33, 51], ["U", 17.45, 0.75], ["S", 22.82, 25], ["X", 23.24, 0.55],
+  ["L", 24.6, 2.0], ["J", 28.60, 0, 5, 16, 22], ["D", 29.1, 1, 10], ["U", 33.0, 1.2],
+  ["J", 35.93, 3, 13.5, 32, 38], ["S", 42.66, 20]
+];
+
+// meteors: tn(s) size xn yn vz ax ay tau0 explodeTau dzOffset kind
+// relative path: dz = dzOff + vz*tau, x = xn + ax*tau|tau|, y = yn + ay*tau|tau|  (tau = tn - t)
+const M_DEF = [
+  4.70, 2.6, -1, 6.5, 1.30, 0.016, 0.0060, 72, -16, 0, 0,   // P1 single → dash left
+  9.80, 1.6, 2, 1.6, 1.50, 0.020, 0.0080, 60, -12, 0, 1,    // P2 a: low → jump
+  10.50, 2.3, 4.5, 7.4, 1.40, 0.018, 0.0070, 64, -14, 0, 2, // P2 b: high → slide
+  11.10, 1.6, 2, 5.0, 1.50, 0.020, 0.0070, 60, -999, 0, 1,  // P2 c: → dash left, flies off
+  10.95, 2.0, 5, 3.5, 1.20, 0.015, 0.0060, 70, 0, 34, 2,    // P2 d: bursts next to Sonnet
+  29.30, 2.6, -1, 9.0, 1.30, 0.016, 0.0060, 70, -16, 0, 0,  // P5: under the double jump
+  36.45, 5.0, 3, 5.0, 1.15, 0.012, 0.0050, 88, -28, 0, 3    // P6: big one through the gap
+];
+// beams: tNear warn fire end xa ya xb yb emitterEnd
+const B_DEF = [
+  17.30, 16.30, 16.80, 17.95, -22, 1.6, 22, 1.6, 0,
+  23.00, 21.90, 22.40, 23.65, -22, 6.4, 22, 6.4, 1,
+  28.90, 27.90, 28.40, 29.55, -22, 1.6, 22, 1.6, 0,
+  42.60, 41.70, 42.20, 43.05, -22, 14.8, 22, -1.6, 0
+];
+// near misses: t side(0 R,1 L,2 U,3 D) freeze slow shake
+const N_DEF = [4.60, 0, 4, 18, 1, 9.63, 3, 3, 12, 0, 10.26, 2, 3, 12, 0, 11.01, 0, 4, 18, 1,
+  17.18, 3, 4, 18, 0, 22.83, 2, 4, 18, 0, 29.10, 3, 4, 18, 1, 36.16, 3, 4, 24, 2, 42.53, 2, 4, 18, 1];
+// attack patterns (state machine windows): warn dodge end glanceX glanceY
+const P_DEF = [3.6, 4.55, 4.80, 1, -1, 8.5, 9.5, 11.22, 1, -1, 16.3, 17.0, 17.40, 0, 1,
+  21.9, 22.55, 23.05, 0, -1, 27.9, 28.62, 29.32, 1, -1, 34.4, 35.9, 36.38, 1, 1, 41.7, 42.1, 42.75, -1, -1];
+// skill callouts: t owner(0 Opus, 1 Sonnet) text
+const C_DEF = [1.2, 1, T_FASTER, 8.5, 0, T_ADAPT, 16.6, 1, T_BATCH, 21.2, 0, T_CTX,
+  27.9, 0, T_HALF, 33.0, 1, T_FEWER, 39.6, 0, T_MAXEFF];
+const J_DEF = [6.4, 0, 25.95, 1, 38.2, 0];             // "JINOZ" dust: t mode (0 behind Sonnet, 1 bottom)
+const BUMP_DEF = [25.04, 0, 25.92, 1];                 // shoulder bumps: t who (0 Sonnet hits, 1 Opus hits)
+const SHAKE_DEF = [16.80, 1, 22.40, 1, 28.40, 1, 42.20, 1, 36.30, 2, 37.05, 2, 25.04, 1, 25.92, 1,
+  44.5, 1, 48.6, 2, 9.0, 0];
+
+const TK_GO = sec(0.35), TK_FIN = sec(44.5), TK_WIN = sec(45.4), T_BOOST0 = sec(39.9),
+      T_AURA0 = sec(39.8), T_WARP0 = sec(48.3), T_FLASH0 = T_END - 30, T_WARPIN = sec(0.6),
+      T_DISSOLVE = 36, T_THINK0 = sec(8.6), T_THINK1 = sec(11.2), T_RECALL0 = sec(21.3),
+      T_RECALL1 = sec(22.5);
+
+// ------------------------------------------------------------------ baking
+const vO = new Float32Array(NT), sO = new Float64Array(NT), xO = new Float32Array(NT);
+const gapS = new Float32Array(NT), xS = new Float32Array(NT);
+const F_AIR = 1, F_SLIDE = 2, F_DASH = 4, F_STUM = 8, F_LOOK = 16, F_LAND = 32, F_CHG = 64, F_DJ2 = 128;
+function makeActor() {
+  return { h: new Float32Array(NT), cr: new Float32Array(NT), sqW: new Float32Array(NT),
+    sqH: new Float32Array(NT), fl: new Uint8Array(NT), dir: new Int8Array(NT) };
+}
+const AO = makeActor(), AS = makeActor();
+
+function bake(kf, out) {
+  const n = kf.length / 3;
+  let k = 0;
+  for (let t = 0; t < NT; t++) {
+    while (k < n - 1 && sec(kf[(k + 1) * 3]) <= t) k++;
+    if (k >= n - 1) { out[t] = kf[k * 3 + 1]; continue; }
+    const t0 = sec(kf[k * 3]), t1 = sec(kf[(k + 1) * 3]);
+    const u = t1 > t0 ? (t - t0) / (t1 - t0) : 1;
+    out[t] = kf[k * 3 + 1] + (kf[(k + 1) * 3 + 1] - kf[k * 3 + 1]) * ease(kf[(k + 1) * 3 + 2], u);
+  }
+}
+function put(a, t, f) { return t >= 0 && t < NT ? f(t) : 0; }
+function paintLand(A, te) {
+  for (let k = 0; k < 10; k++) put(A, te + k, (t) => {
+    A.fl[t] |= F_LAND; A.sqH[t] = k < 5 ? -2 : -1; A.sqW[t] = k < 5 ? 2 : 1;
+  });
+}
+function paintCharge(A, ts) {
+  for (let k = 1; k <= 5; k++) put(A, ts - k, (t) => {
+    if (!(A.fl[t] & F_AIR)) { A.fl[t] |= F_CHG; A.sqH[t] = -1; A.sqW[t] = 1; }
+  });
+}
+function paintJump(A, ts, h0, H1, rise, fall) {
+  paintCharge(A, ts);
+  for (let k = 0; k < rise; k++) put(A, ts + k, (t) => {
+    const u = k / rise;
+    A.h[t] = h0 + (H1 - h0) * (1 - (1 - u) * (1 - u)); A.fl[t] |= F_AIR;
+    A.sqH[t] = k < 6 ? 1 : 0; A.sqW[t] = k < 6 ? -1 : 0;
+  });
+  for (let k = 0; k < fall; k++) put(A, ts + rise + k, (t) => {
+    const u = k / fall;
+    A.h[t] = H1 * (1 - u * u); A.fl[t] |= F_AIR; A.sqH[t] = 0; A.sqW[t] = 0;
+  });
+  paintLand(A, ts + rise + fall);
+}
+function paintDJump(A, ts, H1, r1, hang, H2, r2, fall) {
+  paintCharge(A, ts);
+  let t0 = ts;
+  for (let k = 0; k < r1; k++) put(A, t0 + k, (t) => {
+    const u = k / r1; A.h[t] = H1 * (1 - (1 - u) * (1 - u)); A.fl[t] |= F_AIR;
+    A.sqH[t] = k < 6 ? 1 : 0; A.sqW[t] = k < 6 ? -1 : 0;
+  });
+  t0 += r1;
+  for (let k = 0; k < hang; k++) put(A, t0 + k, (t) => {
+    A.h[t] = H1 + 0.15 * Math.sin(k * 0.9); A.fl[t] |= F_AIR; A.sqH[t] = -1; A.sqW[t] = 1;
+  });
+  t0 += hang;
+  for (let k = 0; k < r2; k++) put(A, t0 + k, (t) => {
+    const u = k / r2; A.h[t] = H1 + H2 * (1 - (1 - u) * (1 - u)); A.fl[t] |= F_AIR;
+    if (k === 0) A.fl[t] |= F_DJ2;
+    A.sqH[t] = k < 5 ? 1 : 0; A.sqW[t] = k < 5 ? -1 : 0;
+  });
+  t0 += r2;
+  for (let k = 0; k < fall; k++) put(A, t0 + k, (t) => {
+    const u = k / fall; A.h[t] = (H1 + H2) * (1 - u * u); A.fl[t] |= F_AIR; A.sqH[t] = 0; A.sqW[t] = 0;
+  });
+  paintLand(A, t0 + fall);
+}
+function paintSlide(A, ts, dur) {
+  for (let k = 0; k < dur; k++) put(A, ts + k, (t) => {
+    let c = k < 5 ? k / 5 : (k > dur - 9 ? (dur - k) / 9 : 1);
+    c = c * c * (3 - 2 * c);
+    A.cr[t] = c; A.sqH[t] = -3.5 * c; A.sqW[t] = c; A.fl[t] |= F_SLIDE;
+  });
+}
+function paintFlag(A, ts, dur, f, d) {
+  for (let k = 0; k < dur; k++) put(A, ts + k, (t) => { A.fl[t] |= f; if (d !== 0) A.dir[t] = d; });
+}
+function paintStumble(A, ts, dur) {
+  for (let k = 0; k < dur; k++) put(A, ts + k, (t) => {
+    A.fl[t] |= F_STUM; A.h[t] = Math.max(A.h[t], 0.9 * Math.abs(Math.sin(k * 0.45)));
+  });
+}
+function paintActions(A, list) {
+  for (const a of list) {
+    const ts = sec(a[1]);
+    switch (a[0]) {
+      case "J": paintJump(A, ts, a[2], a[3], a[4], a[5]); break;
+      case "Q": paintDJump(A, ts, a[2], a[3], a[4], a[5], a[6], a[7]); break;
+      case "S": paintSlide(A, ts, a[2]); break;
+      case "D": paintFlag(A, ts, a[3], F_DASH, a[2]); break;
+      case "U": paintFlag(A, ts, sec(a[2]), F_DASH, 0); break;
+      case "L": paintFlag(A, ts, sec(a[2]), F_LOOK, 0); break;
+      case "X": paintStumble(A, ts, sec(a[2])); break;
+    }
+  }
+}
+
+bake(KF_SPEED, vO); bake(KF_XO, xO); bake(KF_GAP, gapS); bake(KF_XS, xS);
+sO[0] = 0;
+for (let t = 1; t < NT; t++) sO[t] = sO[t - 1] + vO[t - 1];
+paintActions(AO, ACT_O);
+paintActions(AS, ACT_S);
+
+// track features placed where Opus will be at a given moment
+const S_RAMP0 = sO[sec(35.55)], S_RAMP1 = sO[sec(35.9)], RAMP_H = 3;
+const GAP0 = new Float64Array([sO[sec(14.78)], sO[sec(35.9)]]);
+const GAP1 = new Float64Array([sO[sec(14.93)], sO[sec(36.85)]]);
+const S_FIN = sO[TK_FIN], S_WARP = sO[sec(48.75)];
+
+// unpack tables into typed arrays
+const NM = M_DEF.length / 11;
+const mTn = new Int32Array(NM), mSize = new Float32Array(NM), mXn = new Float32Array(NM),
+      mYn = new Float32Array(NM), mVz = new Float32Array(NM), mAx = new Float32Array(NM),
+      mAy = new Float32Array(NM), mTau0 = new Int32Array(NM), mExpl = new Int32Array(NM),
+      mDzOff = new Float32Array(NM), mKind = new Uint8Array(NM);
+for (let i = 0; i < NM; i++) {
+  const o = i * 11;
+  mTn[i] = sec(M_DEF[o]); mSize[i] = M_DEF[o + 1]; mXn[i] = M_DEF[o + 2]; mYn[i] = M_DEF[o + 3];
+  mVz[i] = M_DEF[o + 4]; mAx[i] = M_DEF[o + 5]; mAy[i] = M_DEF[o + 6]; mTau0[i] = M_DEF[o + 7];
+  mExpl[i] = M_DEF[o + 8]; mDzOff[i] = M_DEF[o + 9]; mKind[i] = M_DEF[o + 10];
+}
+const NB = B_DEF.length / 9;
+const bS = new Float64Array(NB), bWarn = new Int32Array(NB), bFire = new Int32Array(NB),
+      bEnd = new Int32Array(NB), bXa = new Float32Array(NB), bYa = new Float32Array(NB),
+      bXb = new Float32Array(NB), bYb = new Float32Array(NB), bEmit = new Uint8Array(NB);
+for (let i = 0; i < NB; i++) {
+  const o = i * 9;
+  bS[i] = sO[sec(B_DEF[o])]; bWarn[i] = sec(B_DEF[o + 1]); bFire[i] = sec(B_DEF[o + 2]);
+  bEnd[i] = sec(B_DEF[o + 3]); bXa[i] = B_DEF[o + 4]; bYa[i] = B_DEF[o + 5];
+  bXb[i] = B_DEF[o + 6]; bYb[i] = B_DEF[o + 7]; bEmit[i] = B_DEF[o + 8];
+}
+function ticksOf(def, stride) {
+  const n = def.length / stride, a = new Int32Array(n);
+  for (let i = 0; i < n; i++) a[i] = sec(def[i * stride]);
+  return a;
+}
+const nT = ticksOf(N_DEF, 5), NNEAR = nT.length;
+const pWarn = ticksOf(P_DEF, 5), NPAT = pWarn.length;
+const pDodge = new Int32Array(NPAT), pEnd = new Int32Array(NPAT), pGX = new Int8Array(NPAT), pGY = new Int8Array(NPAT);
+for (let i = 0; i < NPAT; i++) {
+  pDodge[i] = sec(P_DEF[i * 5 + 1]); pEnd[i] = sec(P_DEF[i * 5 + 2]);
+  pGX[i] = P_DEF[i * 5 + 3]; pGY[i] = P_DEF[i * 5 + 4];
+}
+const cT = ticksOf(C_DEF, 3), NCALL = cT.length;
+const jT = ticksOf(J_DEF, 2), NJZ = jT.length;
+const bumpTk = ticksOf(BUMP_DEF, 2), NBUMP = bumpTk.length;
+const shT = ticksOf(SHAKE_DEF, 2), NSHK = shT.length;
+
+// ------------------------------------------------------------------- track
+function roadX(s) { return 42 * Math.sin(s * 0.0043) + 12 * Math.sin(s * 0.0121 + 1.3); }
+function roadXd(s) { return 0.1806 * Math.cos(s * 0.0043) + 0.1452 * Math.cos(s * 0.0121 + 1.3); }
+function roadY(s) {
+  let y = 3.0 * Math.sin(s * 0.0089 + 0.4) + 1.3 * Math.sin(s * 0.0197 + 2.1);
+  if (s >= S_RAMP0 && s < S_RAMP1) { const u = (s - S_RAMP0) / (S_RAMP1 - S_RAMP0); y += RAMP_H * u * u; }
+  return y;
+}
+function isGap(s0, s1) {                     // does road interval [s0,s1) touch a gap?
+  for (let i = 0; i < GAP0.length; i++) if (s0 < GAP1[i] && s1 > GAP0[i]) return true;
+  return false;
+}
+function segKind(seg) {                      // 0 normal, 1 jump pad, 2 finish line
+  const s = seg * SEG;
+  if (s >= S_RAMP0 - SEG && s < S_RAMP1) return 1;
+  if (s >= S_FIN - SEG && s < S_FIN + SEG) return 2;
+  return 0;
+}
+
+// =========================================================================
+//  PARTICLES — one zero-allocation pool for every spark, trail, drip, dust
+// =========================================================================
+const PN = 1600;
+const pX = new Float32Array(PN), pY = new Float32Array(PN), pZ = new Float32Array(PN),
+      pVX = new Float32Array(PN), pVY = new Float32Array(PN), pVZ = new Float32Array(PN),
+      pTX = new Float32Array(PN), pTY = new Float32Array(PN);
+const pAge = new Uint16Array(PN), pLife = new Uint16Array(PN), pType = new Uint8Array(PN), pAux = new Uint8Array(PN);
+let pNext = 0;
+// types
+const PT_SPARK = 1, PT_RSPARK = 2, PT_FIRE = 3, PT_DEBRIS = 4, PT_DRIP = 5, PT_FLAME = 6,
+      PT_PUFF = 7, PT_JDUST = 8, PT_CONF = 9, PT_MSPARK = 10, PT_TSPARK = 11;
+// space: 0 screen px, 1 world (static on the track), 2 camera-track frame
+const PT_SPACE = new Uint8Array([0, 0, 0, 2, 2, 1, 0, 1, 0, 0, 1, 2]);
+// colour ramps (palette indices, young → old)
+const R_SPARK = new Uint8Array([WHT, YEL, YEL, ORG, ORG, RED, REDD]);
+const R_FIRE = new Uint8Array([WHT, YEL, ORG, ORG, RED, RED, REDD, RKD, NV1]);
+const R_DEBRIS = new Uint8Array([RKL, RKL, RKM, RKM, RKD]);
+const R_FLAME = new Uint8Array([WHT, YEL, YEL, ORG, ORG, RED, REDD]);
+const R_PUFF = new Uint8Array([STR, RKL, RKM, NV2]);
+const R_MSPARK = new Uint8Array([WHT, MAG, MAG, VIO, VIOD]);
+const R_JFADE = new Uint8Array([STR, RKL, RKM, NV2]);
+
+function spawn(type, x, y, z, vx, vy, vz, life, aux) {
+  const i = pNext;
+  pNext = pNext + 1 === PN ? 0 : pNext + 1;
+  pType[i] = type; pX[i] = x; pY[i] = y; pZ[i] = z; pVX[i] = vx; pVY[i] = vy; pVZ[i] = vz;
+  pAge[i] = 0; pLife[i] = life; pAux[i] = aux;
+  return i;
+}
+function pColor(i) {
+  const a = pAge[i], l = pLife[i], t = pType[i];
+  const f = a / l;
+  switch (t) {
+    case PT_SPARK: return R_SPARK[(f * 7) | 0];
+    case PT_RSPARK: case PT_CONF: {
+      const k = (f * 7) | 0, c = pAux[i];
+      return k === 0 ? WHT : (k < 4 ? LANE[c] : (k < 6 ? LANED[c] : NV2));
+    }
+    case PT_DRIP: {
+      const k = (f * 6) | 0, c = pAux[i];
+      return k === 0 ? WHT : (k < 3 ? LANE[c] : (k < 5 ? LANED[c] : NV2));
+    }
+    case PT_FIRE: return R_FIRE[(f * 9) | 0];
+    case PT_DEBRIS: return R_DEBRIS[(f * 5) | 0];
+    case PT_FLAME: return R_FLAME[(f * 7) | 0];
+    case PT_PUFF: return R_PUFF[(f * 4) | 0];
+    case PT_MSPARK: case PT_TSPARK: return R_MSPARK[(f * 5) | 0];
+    case PT_JDUST:
+      if (a < 30) return STR;
+      if (a < 86) return ((i + (a >> 2)) & 3) ? WHT : STR;
+      return R_JFADE[clamp(((a - 86) / (l - 86) * 4) | 0, 0, 3)];
+  }
+  return WHT;
+}
+
+// "JINOZ" dust anchor (screen) for the active dust message
+let jAX = 0, jAY = 0, jMode = 0, jActive = 0, jAge = 0;
+function jdustStep(i, a) {
+  if (a < 9) { pX[i] += pVX[i]; pY[i] += pVY[i]; pVX[i] *= 0.86; pVY[i] *= 0.86; }
+  else if (a < 30) { pX[i] += (jAX + pTX[i] - pX[i]) * 0.22; pY[i] += (jAY + pTY[i] - pY[i]) * 0.22; }
+  else if (a < 86) { pX[i] = jAX + pTX[i]; pY[i] = jAY + pTY[i]; }
+  else { pX[i] += pZ[i]; pY[i] += pVZ[i] - 0.12; pZ[i] *= 0.97; }
+}
+
+function pUpdate(dS) {
+  for (let i = 0; i < PN; i++) {
+    if (pLife[i] === 0) continue;
+    const a = ++pAge[i];
+    if (a >= pLife[i]) { pLife[i] = 0; continue; }
+    switch (pType[i]) {
+      case PT_SPARK: case PT_RSPARK:
+        pVY[i] += 0.11; pVX[i] *= 0.97; pX[i] += pVX[i]; pY[i] += pVY[i]; break;
+      case PT_CONF:
+        pVY[i] = pVY[i] * 0.95 + 0.05; pVX[i] = pVX[i] * 0.96 + (RT[(i * 13 + a) & 1023] - 0.5) * 0.3;
+        pX[i] += pVX[i]; pY[i] += pVY[i]; break;
+      case PT_FLAME:
+        pVY[i] -= 0.035; pVX[i] = pVX[i] * 0.9 + (RT[(i * 7 + a) & 1023] - 0.5) * 0.3;
+        pX[i] += pVX[i]; pY[i] += pVY[i]; break;
+      case PT_JDUST: jdustStep(i, a); break;
+      case PT_FIRE:
+        pX[i] += pVX[i]; pY[i] += pVY[i]; pZ[i] += pVZ[i];
+        pVX[i] *= 0.93; pVY[i] = pVY[i] * 0.93 + 0.004; pVZ[i] *= 0.93; break;
+      case PT_DEBRIS:
+        pX[i] += pVX[i]; pY[i] += pVY[i]; pZ[i] += pVZ[i]; pVY[i] -= 0.025; break;
+      case PT_TSPARK:
+        pX[i] += pVX[i]; pY[i] += pVY[i]; pZ[i] += pVZ[i]; pVY[i] -= 0.03; break;
+      case PT_DRIP:
+        pZ[i] -= dS; pY[i] += pVY[i]; pVY[i] -= 0.012; break;
+      case PT_PUFF: case PT_MSPARK:
+        pZ[i] -= dS; pX[i] += pVX[i]; pY[i] += pVY[i]; pVX[i] *= 0.9; pVY[i] *= 0.9; break;
+    }
+    if (PT_SPACE[pType[i]] !== 0 && pZ[i] < -70) pLife[i] = 0;
+  }
+}
+
+// =========================================================================
+//  AFTERIMAGES (Sonnet) — rainbow silhouettes in the camera-track frame
+// =========================================================================
+const GN = 8;
+const gDz = new Float32Array(GN), gX = new Float32Array(GN), gH = new Float32Array(GN),
+      gAge = new Uint8Array(GN), gCol = new Uint8Array(GN), gOn = new Uint8Array(GN),
+      gLegA = new Uint8Array(GN), gLegB = new Uint8Array(GN);
+let gNext = 0, gCount = 0;
+
+// =========================================================================
+//  PRE-RENDERED BACKDROP: sky table, stars, nebula, planet, black holes
+// =========================================================================
+const SKY_C1 = new Uint8Array(256), SKY_C2 = new Uint8Array(256), SKY_T = new Uint8Array(256);
+for (let d = -128; d < 128; d++) {
+  let c1 = BLK, c2 = BLK, f = 0;
+  if (d < -36) { c1 = BLK; c2 = BLK; }
+  else if (d < -22) { c1 = BLK; c2 = NV0; f = (d + 36) / 14; }
+  else if (d < -9) { c1 = NV0; c2 = NV1; f = (d + 22) / 13; }
+  else if (d < -2) { c1 = NV1; c2 = NV2; f = (d + 9) / 7; }
+  else if (d <= 1) { c1 = NV2; c2 = PU0; f = 0.4; }
+  else if (d < 10) { c1 = NV2; c2 = NV1; f = (d - 1) / 9; }
+  else if (d < 26) { c1 = NV1; c2 = PU0; f = (d - 10) / 16; }
+  else if (d < 44) { c1 = PU0; c2 = NV0; f = (d - 26) / 18; }
+  else if (d < 56) { c1 = NV0; c2 = BLK; f = (d - 44) / 12; }
+  SKY_C1[d + 128] = c1; SKY_C2[d + 128] = c2; SKY_T[d + 128] = Math.round(clamp(f, 0, 1) * 16);
+}
+
+const NSTAR = 96, PANW = 420;
+const stX = new Float32Array(NSTAR), stD = new Int16Array(NSTAR), stC = new Uint8Array(NSTAR), stTw = new Int16Array(NSTAR);
+for (let i = 0; i < NSTAR; i++) {
+  stX[i] = rnd() * PANW;
+  let d = Math.round(-42 + rnd() * 98);
+  if (d > -3 && d < 3) d -= 6;
+  stD[i] = d;
+  const r = rnd();
+  stC[i] = r < 0.18 ? WHT : (r < 0.62 ? STR : NV2);
+  stTw[i] = rnd() < 0.2 ? Math.floor(rnd() * 120) : -1;
+}
+
+// generic sprite store: index 255 = transparent
+function makeSprite(w, h) { const a = new Uint8Array(w * h); a.fill(255); return a; }
+function hash2(x, y) {
+  let h = Math.imul(x, 374761393) + Math.imul(y, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+// nebula (dithered, purple/blue/magenta)
+const NEB_W = 104, NEB_H = 46, NEB = makeSprite(NEB_W, NEB_H);
+for (let y = 0; y < NEB_H; y++) for (let x = 0; x < NEB_W; x++) {
+  const nx = (x - NEB_W / 2) / (NEB_W / 2), ny = (y - NEB_H / 2) / (NEB_H / 2);
+  const fall = 1 - (nx * nx * 0.85 + ny * ny * 0.95);
+  if (fall <= 0) continue;
+  let n = 0.58 * vnoise(x / 15 + 3, y / 9 + 7) + 0.3 * vnoise(x / 6 + 11, y / 5) + 0.12 * vnoise(x / 2.5, y / 2.5 + 5);
+  n = n * (0.35 + 0.9 * fall) + (BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.5) * 0.12;
+  let c = 255;
+  if (n > 0.74) c = (hash2(x, y) < 0.35) ? MAG : VIO;
+  else if (n > 0.64) c = x > NEB_W * 0.6 ? BLUD : VIOD;
+  else if (n > 0.55) c = PU1;
+  else if (n > 0.46) c = PU0;
+  if (c !== 255 && n > 0.8 && hash2(y, x) < 0.25) c = WHT;
+  NEB[y * NEB_W + x] = c;
+}
+// ringed planet
+const PLA_W = 50, PLA_H = 30, PLA = makeSprite(PLA_W, PLA_H);
+{
+  const cx = 25, cy = 15, r = 11;
+  for (let y = 0; y < PLA_H; y++) for (let x = 0; x < PLA_W; x++) {
+    const dx = x - cx + 0.5, dy = y - cy + 0.5;
+    const e = Math.sqrt((dx / 23) * (dx / 23) + (dy / 5.2) * (dy / 5.2));
+    const inRing = (e > 0.62 && e < 0.8) || (e > 0.84 && e < 1.0);
+    const ringCol = e < 0.8 ? STR : RKL;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < r * r) {
+      if (inRing && dy > 0) { PLA[y * PLA_W + x] = ringCol; continue; }   // ring passes in front
+      const nx = dx / r, ny = dy / r, nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny));
+      const lam = -0.55 * nx - 0.55 * ny + 0.63 * nz + (BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.5) * 0.18;
+      const band = Math.floor((ny + 1) * 3.6 + 0.3 * Math.sin(nx * 4)) & 1;
+      let c;
+      if (lam > 0.72) c = band ? CYA : CYAD;
+      else if (lam > 0.42) c = band ? CYAD : BLUD;
+      else if (lam > 0.12) c = band ? BLUD : NV2;
+      else c = NV1;
+      PLA[y * PLA_W + x] = c;
+    } else if (inRing) PLA[y * PLA_W + x] = ringCol;
+  }
+}
+// black holes: type map + phase map (animated by colour cycling, never rotated)
+function makeBH(w, h, rh, A, B) {
+  const ty = new Uint8Array(w * h), ph = new Uint8Array(w * h);
+  const cx = w / 2, cy = h / 2;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const dx = x - cx + 0.5, dy = y - cy + 0.5, i = y * w + x;
+    const r = Math.sqrt(dx * dx + dy * dy);
+    const e = Math.sqrt((dx / A) * (dx / A) + (dy / B) * (dy / B));
+    const inDisk = e >= 0.36 && e <= 1.0;
+    const ang = Math.atan2(dy / B, dx / A);
+    ph[i] = (Math.floor((ang + Math.PI) / (2 * Math.PI) * 24) + Math.floor((e - 0.36) / 0.64 * 3) * 4) % 24;
+    if (inDisk && dy >= -0.5) { ty[i] = 3; continue; }              // disk in front of the hole
+    if (r < rh) { ty[i] = 1; continue; }                             // event horizon
+    if (r < rh + 1) { ty[i] = 2; continue; }                         // photon ring
+    if (dy < 0 && r < rh + 3.2) { ty[i] = 4; ph[i] = Math.floor((ang + Math.PI) * 4) % 24; continue; } // lensed arc
+    if (dy > 0 && r < rh + 2) { ty[i] = 4; continue; }
+    if (inDisk) { ty[i] = 3; continue; }                             // disk behind
+    const g = BAYER[(y & 3) * 4 + (x & 3)];
+    if (r < rh + 7 && g < 7) ty[i] = 5;
+    else if (r < rh + 13 && g < 3) ty[i] = 6;
+  }
+  return { w, h, ty, ph };
+}
+const BH1 = makeBH(62, 34, 6, 28, 6.2), BH2 = makeBH(30, 18, 3, 13, 3.2);
+const DISK = new Uint8Array([WHT, YEL, YEL, ORG, ORG, RED, ORG, YEL, ORG, ORG, RED, REDD,
+  ORG, YEL, WHT, YEL, ORG, RED, REDD, RED, ORG, ORG, YEL, ORG]);
+
+// mid-layer "warp" stars streaming out of the vanishing point
+const NWS = 48;
+const wsC = new Float32Array(NWS), wsS = new Float32Array(NWS), wsR = new Float32Array(NWS), wsR0 = new Float32Array(NWS);
+for (let i = 0; i < NWS; i++) {
+  const a = i * 2.39996 + 0.3;
+  wsC[i] = Math.cos(a); wsS[i] = Math.sin(a) * 0.62;
+  wsR0[i] = 5 + ((i * 37) % 100);
+}
+// near-layer speed lines (upper half, radial)
+const NSL = 28;
+const slA = new Uint8Array(NSL), slR = new Float32Array(NSL), slR0 = new Float32Array(NSL);
+const SL_C = new Float32Array(NSL), SL_S = new Float32Array(NSL);
+for (let i = 0; i < NSL; i++) {
+  const a = Math.PI + (i + 0.5) / NSL * Math.PI;
+  SL_C[i] = Math.cos(a); SL_S[i] = Math.sin(a) * 0.7;
+  slR0[i] = 34 + ((i * 29) % 90);
+}
+const LUMP = new Float32Array([1, 0.93, 0.97, 1.05, 0.9, 0.96, 1.03, 0.94, 0.99, 1.06, 0.91, 0.98, 1.04, 0.93, 1.0, 0.95]);
+// lava cracks per meteor kind: x0,y0,x1,y1 (unit radius)
+const CRACK = [
+  new Float32Array([-0.5, -0.2, -0.1, 0.05, -0.1, 0.05, 0.35, -0.25, -0.1, 0.05, 0.05, 0.45]),
+  new Float32Array([-0.4, 0.3, 0.1, -0.1, 0.1, -0.1, 0.45, 0.15]),
+  new Float32Array([-0.55, 0.0, 0.0, -0.15, 0.0, -0.15, 0.2, -0.5, 0.0, -0.15, 0.4, 0.25]),
+  new Float32Array([-0.6, -0.1, -0.15, 0.1, -0.15, 0.1, 0.3, -0.3, -0.15, 0.1, 0.0, 0.55, 0.3, -0.3, 0.6, -0.1])
+];
+const WARN_BMP = new Uint8Array([0,0,0,1,0,0,0, 0,0,1,1,1,0,0, 0,0,1,2,1,0,0, 0,1,1,2,1,1,0,
+  0,1,1,1,1,1,0, 1,1,1,2,1,1,1, 1,1,1,1,1,1,1]);
+const SHAKE_PAT = new Int8Array([2, -1, -2, 1, 1, 2, -2, -1, 2, 0, -1, 1, 1, -1, -1, 0, 1, 0, 0, 1, -1, 0, 0, 0]);
+const WOB = new Int8Array([0, 1, 1, 0, -1, -1, 0, 1, 0, -1]);
+
+// =========================================================================
+//  SIMULATION STATE
+// =========================================================================
+const ST_RUN = 0, ST_WARN = 1, ST_DODGE = 2, ST_NEAR = 3, ST_BOOST = 4, ST_WARP = 5;
+let tick = 0, state = ST_RUN, stateT = 0, nearHold = 0;
+let freezeLeft = 0, slowLeft = 0, slowPhase = 0;
+// camera
+let camS = 0, camX = 0, camAbove = EYE, camAbsD = EYE, roadX0 = 0, roadXd0 = 0, roadY0 = 0;
+let hY = HORIZON, cxS = 80, glanceX = 0, glanceY = 0, shakeT = 0, shakeAmp = 0, shakeX = 0, shakeY = 0;
+let joltX = 0;
+// near miss feedback
+let nmSide = -1, nmT = 0, nmTextT = 0, nmTextSide = 0;
+// 12 fps pose sampling
+let poseTimer = 0, runO = 0, runS = 0;
+let pArmL = 0, pArmR = 0, pArmDx = 0, pBob = 0, pDip = 0;
+let sLegA = 0, sLegB = 0, sArmL = 0, sArmR = 0, sSqW = 0, sSqH = 0, sLean = 0, sEyes = 0, sEyeDx = 0, sBob = 0;
+// effects
+let ghostT = 99, ghostDir = 0, ringT = 99, bumpT = 99, bumpWho = 0;
+let bigId = -1, bigT = 0, bigCol = WHT, calIdx = -1, calT = 0, posNow = 2, posFlash = 0;
+let finFlash = 0, auraLv = 0;
+// per-frame Sonnet screen info (filled while rendering)
+let sonVis = 0, sonSX = 0, sonTop = 0, mirSX = 0, mirTop = 0;
+
+function boostOn(t) { return t >= T_BOOST0 && t < T_WARP0; }
+function startShake(a) { if (a <= 0) return; if (a >= shakeAmp || shakeT <= 0) { shakeAmp = a; shakeT = SHAKE_PAT.length >> 1; } }
+
+// ------------------------------------------------------------- camera
+function updateCamera(t) {
+  camS = sO[t];
+  camX = xO[t];
+  roadX0 = roadX(camS); roadXd0 = roadXd(camS); roadY0 = roadY(camS);
+  let target = EYE * (1 - 0.52 * AO.cr[t]) + AO.h[t];
+  const f = AO.fl[t];
+  if (f & F_CHG) target -= 0.7;
+  if (f & F_LAND) target -= AO.sqH[t] <= -2 ? 1.3 : 0.6;
+  if (boostOn(t)) target -= 0.6;
+  const abs = roadY0 + target;
+  camAbsD += (abs - camAbsD) * (abs > camAbsD ? 0.22 : 0.42);   // damped follow, slower when rising
+  camAbove = camAbsD - roadY0;
+}
+
+// ------------------------------------------------------------- state machine
+function updateState(t) {
+  let ns = ST_RUN, pat = -1;
+  if (t >= T_WARP0 || t < T_WARPIN) ns = ST_WARP;
+  else {
+    if (boostOn(t)) ns = ST_BOOST;
+    for (let i = 0; i < NPAT; i++) {
+      if (t >= pWarn[i] && t < pEnd[i]) { pat = i; ns = t < pDodge[i] ? ST_WARN : ST_DODGE; break; }
+    }
+    if (nearHold > 0) { ns = ST_NEAR; nearHold--; }
+  }
+  if (ns !== state) { state = ns; stateT = 0; } else stateT++;
+  // WARN: Opus' eyes flick 1px toward the threat (camera glance), then back
+  if (state === ST_WARN && pat >= 0 && stateT >= 4 && stateT < 34) { glanceX = pGX[pat]; glanceY = pGY[pat]; }
+  else { glanceX = 0; glanceY = 0; }
+}
+
+// ------------------------------------------------------------- one-shot events
+function setBig(id, col) { bigId = id; bigT = 0; bigCol = col; }
+function sparksBottom(n, rainbow, spread) {
+  for (let k = 0; k < n; k++) {
+    const x = 80 + (rr() - 0.5) * spread, vx = (x - 80) * 0.03 + (rr() - 0.5) * 1.6;
+    spawn(rainbow ? PT_RSPARK : PT_SPARK, x, 91, 0, vx, -1.4 - rr() * 2.6, 0, 22 + (rr() * 16) | 0, (k + tick) % 7);
+  }
+}
+function sparksEdge(side, n) {                       // side 0 right, 1 left
+  const x = side === 0 ? 156 : 3;
+  for (let k = 0; k < n; k++) {
+    spawn(PT_SPARK, x, 48 + rr() * 30, 0, (side === 0 ? -1 : 1) * (0.6 + rr() * 2.2), -1 - rr() * 2, 0, 18 + (rr() * 12) | 0, 0);
+  }
+}
+function trackSparks(dz, x, y, n, vzBack) {          // sparks in the camera-track frame (e.g. at Sonnet's feet)
+  for (let k = 0; k < n; k++) {
+    spawn(PT_TSPARK, x + (rr() - 0.5) * 4, y + 0.3, dz, (rr() - 0.5) * 0.5, 0.25 + rr() * 0.35, -vzBack * (0.4 + rr() * 0.6), 18 + (rr() * 10) | 0, 0);
+  }
+}
+function startJinoz(mode, t) {
+  jMode = mode; jActive = 1; jAge = 0;
+  computeJAnchor(t);
+  let srcX = 80, srcY = 92;
+  if (mode === 0) { proj(gapS[t], xS[t], yRoadRel(gapS[t])); srcX = PX; srcY = PY; }
+  const s = TXT[T_JINOZ];
+  let gx = 0, n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const g = s[i], gw = GL_W[g];
+    for (let r = 0; r < 5; r++) for (let c = 0; c < gw; c++) {
+      if (!(GL_R[g * 5 + r] & (1 << (gw - 1 - c)))) continue;
+      let sx = srcX, sy = srcY;
+      if (mode === 1) { if (n & 1) { sx = 148; sy = 86; } else { sx = 34 + rr() * 30; sy = 92; } }
+      const a = n * 2.39996, sp = 0.7 + rr() * 1.3;
+      const p = spawn(PT_JDUST, sx + (rr() - 0.5) * 6, sy - rr() * 3, 0, Math.cos(a) * sp, -Math.abs(Math.sin(a)) * sp - 0.6, 0, 116, 0);
+      pTX[p] = gx + c; pTY[p] = r;
+      pZ[p] = (rr() - 0.5) * 0.9; pVZ[p] = -rr() * 0.4;          // drift used when the word dissolves
+      n++;
+    }
+    gx += gw + 1;
+  }
+}
+function computeJAnchor(t) {
+  if (jMode === 1) { jAX = 80 - (TXT_W[T_JINOZ] >> 1); jAY = 63; return; }
+  const dz = gapS[t];
+  if (dz > 2) {
+    proj(dz * 0.85, xS[t], yRoadRel(dz * 0.85) + 0.3);
+    jAX = Math.round(PX) - (TXT_W[T_JINOZ] >> 1); jAY = Math.round(PY) - 3;
+  }
+  jAX = clamp(jAX, 2, W - 3 - TXT_W[T_JINOZ]); jAY = clamp(jAY, 30, 78);
+}
+function explodeMeteor(i, t) {
+  meteorPos(i, t);
+  const big = mSize[i] > 3 ? 2 : 1;
+  for (let k = 0; k < 26 * big; k++) {
+    const a = rr() * 6.283, sp = 0.25 + rr() * 0.6 * big;
+    spawn(PT_DEBRIS, MX, MY, MZ, Math.cos(a) * sp, Math.sin(a) * sp * 0.7 + 0.15, (rr() - 0.5) * 0.8, 30 + (rr() * 25) | 0, 0);
+    if (k & 1) spawn(PT_FIRE, MX, MY, MZ, Math.cos(a) * sp * 0.6, Math.sin(a) * sp * 0.4, (rr() - 0.5) * 0.5, 18 + (rr() * 10) | 0, 0);
+  }
+}
+function handleEvents(t) {
+  for (let i = 0; i < NNEAR; i++) {
+    if (nT[i] !== t) continue;
+    const o = i * 5;
+    freezeLeft = N_DEF[o + 2]; slowLeft = N_DEF[o + 3]; slowPhase = 0;
+    nmSide = N_DEF[o + 1]; nmT = 14; nmTextT = 44; nmTextSide = nmSide; nearHold = 12;
+    startShake(N_DEF[o + 4]);
+    if (nmSide === 0 || nmSide === 1) sparksEdge(nmSide, 10);
+    else if (nmSide === 3) sparksBottom(10, true, 90);
+  }
+  for (let i = 0; i < NCALL; i++) if (cT[i] === t) { calIdx = i; calT = 0; }
+  for (let i = 0; i < NJZ; i++) if (jT[i] === t) startJinoz(J_DEF[i * 2 + 1], t);
+  for (let i = 0; i < NBUMP; i++) if (bumpTk[i] === t) {
+    bumpT = 0; bumpWho = BUMP_DEF[i * 2 + 1];
+    sparksEdge(0, 14);
+  }
+  for (let i = 0; i < NSHK; i++) if (shT[i] === t) startShake(SHAKE_DEF[i * 2 + 1]);
+  for (let i = 0; i < NM; i++) if (mExpl[i] > -900 && t === mTn[i] - mExpl[i]) explodeMeteor(i, t);
+  if (t === TK_GO) setBig(T_GO, YEL);
+  if (t === TK_FIN) {
+    setBig(T_FINISH, WHT); finFlash = 6;
+    for (let k = 0; k < 90; k++) spawn(PT_CONF, rr() * W, -2 - rr() * 30, 0, (rr() - 0.5) * 1.5, rr() * 0.8, 0, 90 + (rr() * 60) | 0, k % 7);
+  }
+  if (t === TK_WIN) setBig(T_WINNER, YEL);
+  // overtakes are detected from the race itself
+  const p = gapS[t] > 0 ? 2 : 1;
+  if (p !== posNow) { posNow = p; posFlash = 40; setBig(p === 1 ? T_OVER : T_SLEADS, p === 1 ? OPH : SNH); }
+}
+
+// ------------------------------------------------------------- continuous emitters
+function emitters(t) {
+  // glowing rainbow drops falling off both road edges into the void
+  if ((t & 1) === 0) {
+    const dz = 16 + RT[(t * 7) & 1023] * 150, s = camS + dz;
+    if (!isGap(s - 1, s + 1)) {
+      const side = (t >> 1) & 1, x = side ? HALFW - 0.2 : -HALFW + 0.2;
+      spawn(PT_DRIP, x, -0.2, dz, 0, -0.03, 0, 70 + ((t * 3) % 40), (t >> 1) % 7);
+    }
+  }
+  // meteor fire trails (lava → dark)
+  for (let i = 0; i < NM; i++) {
+    const tau = mTn[i] - t;
+    if (tau > mTau0[i] || tau <= mExpl[i] || tau < -60) continue;
+    meteorPos(i, t);
+    const at = tau < 0 ? -tau : tau, vx = -2 * mAx[i] * at, vy = -2 * mAy[i] * at, vz = -mVz[i];
+    const n = mSize[i] > 3 ? 4 : 2;
+    for (let k = 0; k < n; k++) {
+      const j = mSize[i] * 0.6;
+      spawn(PT_FIRE, MX + (rr() - 0.5) * j, MY + (rr() - 0.5) * j, MZ + (rr() - 0.5) * j,
+        vx * 0.25, vy * 0.25, vz * 0.25, 16 + (rr() * 14) | 0, 0);
+    }
+  }
+  // magenta sparks at the wobbling beam head
+  for (let i = 0; i < NB; i++) {
+    if (t < bFire[i] || t >= bEnd[i] || ((t - bFire[i]) & 1)) continue;
+    const ext = Math.min(1, (t - bFire[i] + 1) / 9);
+    const ex = bEmit[i] === 0 ? bXa[i] + (bXb[i] - bXa[i]) * ext : bXb[i] + (bXa[i] - bXb[i]) * ext;
+    const ey = bEmit[i] === 0 ? bYa[i] + (bYb[i] - bYa[i]) * ext : bYb[i] + (bYa[i] - bYb[i]) * ext;
+    const dz = bS[i] - camS;
+    if (dz > 2) spawn(PT_MSPARK, ex, ey, dz, (rr() - 0.5) * 0.6, (rr() - 0.3) * 0.5, 0, 14, 0);
+  }
+  // Opus (first person): landing, slide, dash sparks spray up from under the camera
+  const f = AO.fl[t], fp = AO.fl[t > 0 ? t - 1 : 0];
+  if ((f & F_LAND) && !(fp & F_LAND)) { sparksBottom(AO.sqH[t] <= -2 ? 26 : 14, true, 120); }
+  if (f & F_SLIDE) {
+    for (let k = 0; k < 3; k++) {
+      const left = (t + k) & 1, x = left ? 30 + rr() * 22 : 108 + rr() * 22;
+      spawn(PT_SPARK, x, 90, 0, (left ? -1 : 1) * (0.8 + rr() * 1.8), -0.6 - rr() * 1.8, 0, 14 + (rr() * 8) | 0, 0);
+    }
+  }
+  if ((f & F_DASH) && !(fp & F_DASH)) { ghostT = 0; ghostDir = AO.dir[t]; sparksBottom(10, true, 140); }
+  if ((f & F_DJ2) && !(fp & F_DJ2)) ringT = 0;
+  // Sonnet: sparks at its feet, ghosts while dashing / surging
+  const g = AS.fl[t], gp = AS.fl[t > 0 ? t - 1 : 0], gz = gapS[t];
+  if ((g & F_LAND) && !(gp & F_LAND)) trackSparks(gz, xS[t], yRoadRel(gz), 12, 0.6);
+  if ((g & F_SLIDE) && (t & 1)) trackSparks(gz, xS[t], yRoadRel(gz), 2, 0.8);
+  if ((g & F_STUM) && (t % 3 === 0)) trackSparks(gz, xS[t], yRoadRel(gz) + 2, 2, 0.3);
+  if ((g & F_DASH) && (t % 3 === 0)) {
+    const k = gNext; gNext = (gNext + 1) % GN;
+    gDz[k] = gz; gX[k] = xS[t]; gH[k] = AS.h[t]; gAge[k] = 0; gOn[k] = 1; gCol[k] = gCount % 7; gCount++;
+    gLegA[k] = sLegA; gLegB[k] = sLegB;
+  }
+  // aura of the final breakthrough: flames rising around the edges of Opus' view
+  if (auraLv > 0.05) {
+    const n = auraLv > 0.6 ? 9 : 3;
+    for (let k = 0; k < n; k++) {
+      const r = rr();
+      if (r < 0.5) spawn(PT_FLAME, rr() * W, 91, 0, (rr() - 0.5) * 0.6, -0.8 - rr() * 1.2, 0, 22 + (rr() * 16) | 0, 0);
+      else {
+        const left = r < 0.75, x = left ? 1 + rr() * 6 : W - 2 - rr() * 6;
+        spawn(PT_FLAME, x, 44 + rr() * 46, 0, (left ? 0.3 : -0.3), -0.6 - rr(), 0, 18 + (rr() * 14) | 0, 0);
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------- 12fps pose sampling
+function samplePoses(t) {
+  const f = AO.fl[t];
+  const groundO = !(f & F_AIR) && !(f & F_SLIDE);
+  if (groundO) runO = (runO + 1) & 3;
+  let aL = 0, aR = 0, dx = 0, bob = 0, dip = 0;
+  if (f & F_CHG) { aL = aR = 3; dip = 1; }
+  else if (f & F_LAND) { const hard = AO.sqH[t] <= -2; aL = aR = hard ? 5 : 2; dip = hard ? 2 : 1; }
+  else if (f & F_AIR) { const up = AO.h[t] >= AO.h[t > 0 ? t - 1 : 0]; aL = aR = up ? -6 : -3; dx = up ? 0 : 3; }
+  else if (f & F_SLIDE) { aL = aR = -5; dx = -4; }
+  else {
+    aL = runO === 0 ? -3 : (runO === 2 ? 1 : 0);
+    aR = runO === 2 ? -3 : (runO === 0 ? 1 : 0);
+    bob = runO & 1;
+  }
+  if (f & F_DASH) dx -= 2;
+  pArmL = aL; pArmR = aR; pArmDx = dx; pBob = bob; pDip = dip;
+
+  const g = AS.fl[t];
+  const groundS = !(g & F_AIR) && !(g & F_SLIDE);
+  if (groundS) {
+    runS = (runS + 1) & 3;
+    if (runS & 1) {                                   // footstep: small dust puff from the rainbow
+      const gz = gapS[t];
+      for (let k = 0; k < 2; k++) spawn(PT_PUFF, xS[t] + (k ? 3 : -3) + (rr() - 0.5), 0.2, gz - 0.5, (rr() - 0.5) * 0.15, 0.08 + rr() * 0.1, 0, 16, 0);
+    }
+  }
+  if (g & F_AIR) { sLegA = 1; sLegB = 1; }
+  else if (groundS) { sLegA = runS === 0 ? 1 : 0; sLegB = runS === 2 ? 1 : 0; }
+  else { sLegA = 0; sLegB = 0; }
+  if (g & F_STUM) { sArmL = (t >> 2) & 1 ? -1 : 1; sArmR = -sArmL; }
+  else if (g & (F_AIR | F_SLIDE)) { sArmL = -1; sArmR = -1; }
+  else { sArmL = runS === 0 ? -1 : 0; sArmR = runS === 2 ? -1 : 0; }
+  sSqW = Math.round(AS.sqW[t]); sSqH = Math.round(AS.sqH[t]);
+  sLean = (g & F_DASH) ? AS.dir[t] : 0;
+  if (bumpT < 10) sLean = bumpWho === 0 ? -1 : 1;
+  sEyes = (g & F_LOOK) ? 1 : 0;
+  sEyeDx = state === ST_WARN ? glanceX : 0;
+  sBob = groundS && (runS === 0 || runS === 2) ? 1 : 0;
+}
+
+// ------------------------------------------------------------- streaks & lines
+function updateStreaks(t) {
+  const spd = vO[t] * 0.5;
+  for (let i = 0; i < NWS; i++) {
+    wsR[i] += (0.25 + wsR[i] * 0.03) * spd;
+    if (wsR[i] > 125) wsR[i] = 3 + (i % 7);
+  }
+  for (let i = 0; i < NSL; i++) {
+    slR[i] += 5 + 7 * spd;
+    if (slR[i] > 150) { slR[i] = 30 + ((i * 13 + t) % 24); slA[i] = (slA[i] + 11) % NSL; }
+  }
+}
+
+function resetLoop() {
+  tick = 0; state = ST_WARP; stateT = 0; nearHold = 0;
+  freezeLeft = 0; slowLeft = 0; slowPhase = 0;
+  pLife.fill(0); pNext = 0; gOn.fill(0); gNext = 0; gCount = 0; rtI = 0;
+  poseTimer = 0; runO = 0; runS = 0;
+  ghostT = 99; ringT = 99; bumpT = 99; bigId = -1; calIdx = -1; posNow = 2; posFlash = 0;
+  nmT = 0; nmTextT = 0; shakeT = 0; shakeAmp = 0; finFlash = 0; jActive = 0; auraLv = 0;
+  for (let i = 0; i < NWS; i++) wsR[i] = wsR0[i];
+  for (let i = 0; i < NSL; i++) { slR[i] = slR0[i]; slA[i] = i; }
+  camS = sO[0]; roadY0 = roadY(camS); camAbsD = roadY0 + EYE;
+  updateCamera(0);
+  samplePoses(0);
+}
+
+function simStep() {
+  const prevS = sO[tick];
+  tick++;
+  if (tick >= T_END) { resetLoop(); return; }
+  const t = tick, dS = sO[t] - prevS;
+  updateCamera(t);
+  updateState(t);
+  handleEvents(t);
+  auraLv = t < T_AURA0 ? 0 : Math.min(1, (t - T_AURA0) / 48);
+  emitters(t);
+  pUpdate(dS);
+  for (let k = 0; k < GN; k++) if (gOn[k] && ++gAge[k] > 15) gOn[k] = 0;
+  if (++poseTimer >= (vO[t] > 3.0 ? 3 : (vO[t] > 2.4 ? 4 : 5))) { poseTimer = 0; samplePoses(t); }
+  updateStreaks(t);
+  if (jActive) { jAge++; computeJAnchor(t); if (jAge > 118) jActive = 0; }
+  if (shakeT > 0) shakeT--;
+  if (nmT > 0) nmT--;
+  if (nmTextT > 0) nmTextT--;
+  if (ghostT < 99) ghostT++;
+  if (ringT < 99) ringT++;
+  if (bumpT < 99) bumpT++;
+  if (bigId >= 0 && ++bigT > (bigId === T_WINNER ? 175 : 70)) bigId = -1;
+  if (calIdx >= 0 && ++calT > 100) calIdx = -1;
+  if (posFlash > 0) posFlash--;
+  if (finFlash > 0) finFlash--;
+}
+
+// =========================================================================
+//  PROJECTION  (results in PX, PY, PK — no objects are created)
+// =========================================================================
+let PX = 0, PY = 0, PK = 0, MX = 0, MY = 0, MZ = 0;
+function xRoadRel(dz) { return roadX(camS + dz) - roadX0 - dz * roadXd0; }
+function yRoadRel(dz) { return roadY(camS + dz) - roadY0; }
+function proj(dz, x, yAbs) {               // yAbs: height relative to the road under the camera
+  PK = F / dz;
+  PX = cxS + (xRoadRel(dz) + x - camX) * PK;
+  PY = hY + (camAbove - yAbs) * PK;
+}
+const MX0 = 48, MY0 = 9, MW = 64, MH = 14, MX1 = MX0 + MW - 1, MY1 = MY0 + MH - 1, MCX = 80, MHY = MY0 + 6;
+function xRoadRelB(d) { return roadX(camS - d) - roadX0 + d * roadXd0; }
+function yRoadRelB(d) { return roadY(camS - d) - roadY0; }
+function projM(d, x, yAbs) {               // rear-view mirror (looking back, left stays left)
+  PK = FM / d;
+  PX = MCX + (xRoadRelB(d) + x - camX) * PK;
+  PY = MHY + (camAbove - yAbs) * PK;
+}
+function meteorPos(i, t) {
+  const tau = mTn[i] - t, q = tau * (tau < 0 ? -tau : tau);
+  MZ = mDzOff[i] + mVz[i] * tau;
+  MX = mXn[i] + mAx[i] * q;
+  MY = mYn[i] + mAy[i] * q;
+}
+// integer camera offsets: anticipation, boost, glance, shake, landing dip
+function computeView(t) {
+  const spd = vO[t] * 0.5;
+  shakeX = 0; shakeY = 0;
+  if (shakeT > 0) {
+    const k = (SHAKE_PAT.length >> 1) - shakeT;
+    shakeX = SHAKE_PAT[k * 2] * shakeAmp >> 1; shakeY = SHAKE_PAT[k * 2 + 1] * shakeAmp >> 1;
+    if (shakeAmp === 1) { shakeX = SHAKE_PAT[k * 2] > 0 ? 1 : (SHAKE_PAT[k * 2] < 0 ? -1 : 0); shakeY = SHAKE_PAT[k * 2 + 1] > 0 ? 1 : (SHAKE_PAT[k * 2 + 1] < 0 ? -1 : 0); }
+  }
+  joltX = 0;
+  if (bumpT < 8) joltX = (bumpWho === 0 ? 1 : -1) * (bumpT < 4 ? 2 : 1);
+  let hy = HORIZON - Math.round((spd - 1) * 3) - (boostOn(t) ? 2 : 0);
+  hy += glanceY + shakeY + pDip + pBob;          // head bob on each footfall (12 fps pose)
+  const look = clamp(Math.round(xRoadRel(70) * 0.08 * spd), -3, 3);
+  hY = hy;
+  cxS = 80 + glanceX + shakeX + joltX + look;
+}
+
+// =========================================================================
+//  BACKGROUND: dithered deep space, nebula, stars, planet, black holes
+// =========================================================================
+function blitSprite(spr, w, h, x0, y0) {
+  for (let y = 0; y < h; y++) {
+    const sy = y0 + y;
+    if (sy < 0 || sy >= H) continue;
+    for (let x = 0; x < w; x++) {
+      const c = spr[y * w + x];
+      if (c === 255) continue;
+      const sx = x0 + x;
+      if (sx >= 0 && sx < W) fb[sy * W + sx] = c;
+    }
+  }
+}
+function wrapPan(x) { let v = x % PANW; if (v < 0) v += PANW; if (v > PANW - 70) v -= PANW; return Math.round(v); }
+function drawBH(bh, x0, y0, t) {
+  const w = bh.w, h = bh.h, ty = bh.ty, ph = bh.ph, rot = t >> 2, pulse = (t >> 5) & 1;
+  for (let y = 0; y < h; y++) {
+    const sy = y0 + y;
+    if (sy < 0 || sy >= H) continue;
+    for (let x = 0; x < w; x++) {
+      const k = ty[y * w + x];
+      if (k === 0) continue;
+      const sx = x0 + x;
+      if (sx < 0 || sx >= W) continue;
+      let c;
+      switch (k) {
+        case 1: c = BLK; break;
+        case 2: c = ((x + y + (t >> 3)) & 3) ? WHT : YEL; break;
+        case 3: { const p = ph[y * w + x] + (x < (w >> 1) ? rot : rot + 3); c = DISK[p % 24]; if (x < (w >> 1) && c === REDD) c = ORG; break; }
+        case 4: c = DISK[(ph[y * w + x] + rot + 6) % 24]; if (c === WHT) c = YEL; break;
+        case 5: c = pulse ? PU1 : VIOD; break;
+        default: c = PU0;
+      }
+      fb[sy * W + sx] = c;
+    }
+  }
+}
+function drawBackground(t) {
+  for (let y = 0; y < H; y++) {
+    const d = clamp(y - hY, -128, 127) + 128, c1 = SKY_C1[d], c2 = SKY_C2[d], th = SKY_T[d];
+    const o = y * W, bo = (y & 3) * 4;
+    for (let x = 0; x < W; x++) fb[o + x] = BAYER[bo + (x & 3)] < th ? c2 : c1;
+  }
+  const pan = roadXd0 * 50 + t * 0.006;
+  blitSprite(NEB, NEB_W, NEB_H, wrapPan(-14 - pan * 0.7), hY - 44);
+  for (let i = 0; i < NSTAR; i++) {
+    const sx = wrapPan(stX[i] - pan), sy = hY + stD[i];
+    if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+    let c = stC[i];
+    if (stTw[i] >= 0) {
+      const ph = (t + stTw[i]) % 120;
+      if (ph < 8) { c = WHT; if (ph > 1 && ph < 6) { pset(sx - 1, sy, STR); pset(sx + 1, sy, STR); pset(sx, sy - 1, STR); pset(sx, sy + 1, STR); } }
+      else if (ph < 14) c = STR; else c = NV2;
+    }
+    fb[sy * W + sx] = c;
+  }
+  blitSprite(PLA, PLA_W, PLA_H, wrapPan(104 - pan * 0.8), hY - 37);
+  drawBH(BH1, wrapPan(-9 - pan), hY + 7, t);
+  drawBH(BH2, wrapPan(128 - pan), hY + 17, t);
+  // mid layer: space dust streaking out of the vanishing point (2-6 px by speed)
+  const len = clamp(Math.round(1 + 2.5 * vO[t] * 0.5), 2, 6);
+  for (let i = 0; i < NWS; i++) {
+    const r = wsR[i];
+    const x1 = Math.round(cxS + wsC[i] * r), y1 = Math.round(hY + wsS[i] * r);
+    const r0 = r - len * (0.6 + r / 120);
+    const x0 = Math.round(cxS + wsC[i] * r0), y0 = Math.round(hY + wsS[i] * r0);
+    lineF(x0, y0, x1, y1, r < 30 ? NV2 : (r < 70 ? STR : WHT));
+  }
+}
+
+// =========================================================================
+//  RAINBOW ROAD (pseudo-3D, front-to-back scanlines, writes the z-buffer)
+// =========================================================================
+function drawSpan(nX, nY, nW, nZ, fX, fY, fW, fZ, seg, maxY) {
+  if (fY >= nY) return maxY;
+  let y0 = Math.ceil(fY - 0.5), y1 = Math.floor(nY - 0.5);
+  if (y1 > maxY - 1) y1 = maxY - 1;
+  if (y1 > H - 1) y1 = H - 1;
+  if (y0 < 0) y0 = 0;
+  if (y0 > y1) return maxY;
+  const dark = seg % 6 === 0, kind = segKind(seg), edgeSpark = seg % 4 === 0;
+  const hsh = Math.imul(seg, 2654435761) >>> 0;
+  const spark = (hsh & 7) === 0 ? (hsh >>> 3) % 7 : -1, sparkRow = (y0 + y1) >> 1;
+  const inz = 1 / nZ, ifz = 1 / fZ, dy = nY - fY;
+  for (let y = y0; y <= y1; y++) {
+    const u = (nY - (y + 0.5)) / dy;
+    const xc = nX + (fX - nX) * u, w = nW + (fW - nW) * u;
+    const z = 1 / (inz + (ifz - inz) * u);
+    const xl = xc - w, span = 2 * w;
+    const x0 = Math.ceil(xl - 0.5), x1 = Math.floor(xc + w - 0.5);
+    if (x1 < 0 || x0 > W - 1 || x1 < x0) continue;
+    const row = y * W;
+    for (let l = 0; l < 7; l++) {
+      let a = Math.ceil(xl + span * l / 7 - 0.5), b = l === 6 ? x1 : Math.ceil(xl + span * (l + 1) / 7 - 0.5) - 1;
+      if (a < 0) a = 0;
+      if (b > W - 1) b = W - 1;
+      let c = dark ? LANED[l] : LANE[l];
+      if (kind === 1) c = (seg & 1) ? (l & 1 ? WHT : YEL) : LANE[l];
+      if (kind === 2) c = ((l + seg) & 1) ? WHT : BLK;
+      for (let x = a; x <= b; x++) { fb[row + x] = c; zb[row + x] = z; }
+    }
+    if (x0 >= 0) fb[row + x0] = edgeSpark ? WHT : REDD;
+    if (x1 < W) fb[row + x1] = edgeSpark ? WHT : VIOD;
+    if ((y & 1) === 0) {                                  // dithered glow just outside the ribbon
+      if (x0 - 1 >= 0 && zb[row + x0 - 1] === ZINF) fb[row + x0 - 1] = REDD;
+      if (x1 + 1 < W && zb[row + x1 + 1] === ZINF) fb[row + x1 + 1] = VIOD;
+    }
+    if (y === sparkRow && spark >= 0 && kind === 0) {
+      const sx = Math.round(xl + span * (spark + 0.5) / 7);
+      if (sx >= 0 && sx < W) fb[row + sx] = WHT;
+      if (w > 30 && sx + 1 < W) fb[row + sx + 1] = WHT;
+    }
+  }
+  return y0;
+}
+function drawLip(nX, nY, nW, nZ, maxY) {               // front face of the slab after a gap
+  const lipH = Math.max(1, Math.round(1.6 * F / nZ));
+  const y0 = Math.floor(nY - 0.5) + 1;
+  for (let y = y0; y < y0 + lipH && y < maxY && y < H; y++) {
+    if (y < 0) continue;
+    const x0 = Math.max(0, Math.ceil(nX - nW - 0.5)), x1 = Math.min(W - 1, Math.floor(nX + nW - 0.5));
+    for (let x = x0; x <= x1; x++) {
+      const l = clamp(Math.floor((x - (nX - nW)) / (2 * nW) * 7), 0, 6);
+      fb[y * W + x] = y === y0 + lipH - 1 ? RKD : LANED[l]; zb[y * W + x] = nZ;
+    }
+  }
+}
+function drawRoad() {
+  const base = Math.floor(camS / SEG);
+  let maxY = H, nZ = NEAR, k = F / nZ;
+  let nX = cxS + (xRoadRel(nZ) - camX) * k, nY = hY + (camAbove - yRoadRel(nZ)) * k, nW = HALFW * k;
+  let prevGap = isGap(camS, camS + NEAR);
+  for (let i = 1; i <= NSEG; i++) {
+    const seg = base + i - 1, fz = (base + i) * SEG - camS;
+    if (fz <= nZ) continue;
+    k = F / fz;
+    const fX = cxS + (xRoadRel(fz) - camX) * k, fY = hY + (camAbove - yRoadRel(fz)) * k, fW = HALFW * k;
+    const s0 = seg * SEG, gap = isGap(s0, s0 + SEG);
+    if (!gap) {
+      if (prevGap) drawLip(nX, nY, nW, nZ, maxY);
+      const top = drawSpan(nX, nY, nW, nZ, fX, fY, fW, fz, seg, maxY);
+      if (top < maxY) maxY = top;
+    }
+    prevGap = gap;
+    nX = fX; nY = fY; nW = fW; nZ = fz;
+    if (maxY <= 0) break;
+  }
+}
+
+// =========================================================================
+//  CHARACTER SPRITE — exact 12x8 silhouette, scaled nearest-neighbour,
+//  auto-shaded (hi top/left, shadow bottom/right) + dark outline
+// =========================================================================
+const SB_S = 340, SB_H = 280, sbuf = new Uint8Array(SB_S * SB_H);
+let cLegA = 0, cLegB = 0, cArmL = 0, cArmR = 0, cEyes = 0, cEyeDx = 0, cLean = 0, cSqW = 0, cSqH = 0;
+let cHi = OPH, cBody = OPB, cSh = OPS, cOutline = BLK, cSil = -1, cDepth = 0, cDither = 0;
+function cell(row, col) {          // 0 empty, 1 body, 2 eye, 3 carved gap (no outline), 4 leg
+  if (col >= 2 && col <= 9 && row >= 0 && row <= 5) {
+    if (cEyes && row === 1 && (col === 3 + cEyeDx || col === 8 + cEyeDx)) return 2;
+    return 1;
+  }
+  if (col <= 1 && row >= 2 + cArmL && row <= 3 + cArmL) return 1;
+  if (col >= 10 && row >= 2 + cArmR && row <= 3 + cArmR) return 1;
+  if (row >= 6 && row <= 7) {
+    if (col === 2 || col === 7) return row === 7 && cLegA ? 3 : 4;
+    if (col === 4 || col === 9) return row === 7 && cLegB ? 3 : 4;
+    if (col >= 3 && col <= 8) return 3;
+  }
+  return 0;
+}
+function drawCharacter(cx, footY, k) {
+  let Wp = Math.round((12 + cSqW) * k), Hp = Math.round((8 + cSqH) * k);
+  if (Wp < 3) Wp = 3;
+  if (Hp < 2) Hp = 2;
+  const lean = Math.round(cLean * Math.max(1, k * 0.7)), al = lean < 0 ? -lean : lean;
+  if (Wp + al + 2 > SB_S || Hp + 2 > SB_H) return;
+  const x0 = Math.round(cx - Wp / 2) - 1 - (lean < 0 ? al : 0), y0 = Math.round(footY) - Hp - 1;
+  const bw = Wp + 2 + al, bh = Hp + 2;
+  if (x0 > clipR || y0 > clipB || x0 + bw < clipL || y0 + bh < clipT) return;
+  for (let y = 0; y < bh; y++) sbuf.fill(0, y * SB_S, y * SB_S + bw);
+  for (let py = 0; py < Hp; py++) {
+    const row = (py * 8 / Hp) | 0;
+    const shift = lean === 0 ? 0 : Math.round(lean * (Hp - 1 - py) / (Hp > 1 ? Hp - 1 : 1));
+    const o = (py + 1) * SB_S + 1 + (lean < 0 ? al : 0) + shift;
+    for (let px = 0; px < Wp; px++) sbuf[o + px] = cell(row, (px * 12 / Wp) | 0);
+  }
+  for (let y = 0; y < bh; y++) {
+    const sy = y0 + y;
+    if (sy < clipT || sy > clipB) continue;
+    for (let x = 0; x < bw; x++) {
+      const sx = x0 + x;
+      if (sx < clipL || sx > clipR) continue;
+      const i = y * SB_S + x, c = sbuf[i];
+      let col = -1;
+      if (c === 1 || c === 2 || c === 4) {
+        if (cSil >= 0) col = cSil;
+        else if (c === 2) col = BLK;
+        else {
+          const up = y > 0 ? sbuf[i - SB_S] : 0, dn = y < bh - 1 ? sbuf[i + SB_S] : 0;
+          const lf = x > 0 ? sbuf[i - 1] : 0, rt = x < bw - 1 ? sbuf[i + 1] : 0;
+          const upE = up === 0 || up === 3, lfE = lf === 0 || lf === 3;
+          const dnE = dn === 0 || dn === 3, rtE = rt === 0 || rt === 3;
+          if (c === 4) col = lfE ? cBody : cSh;
+          else col = (upE || lfE) ? cHi : ((dnE || rtE) ? cSh : cBody);
+        }
+      } else if (c === 0 && cSil < 0 && cOutline >= 0) {
+        const up = y > 0 ? sbuf[i - SB_S] : 0, dn = y < bh - 1 ? sbuf[i + SB_S] : 0;
+        const lf = x > 0 ? sbuf[i - 1] : 0, rt = x < bw - 1 ? sbuf[i + 1] : 0;
+        if ((up === 1 || up === 2 || up === 4) || (dn === 1 || dn === 2 || dn === 4) ||
+            (lf === 1 || lf === 2 || lf === 4) || (rt === 1 || rt === 2 || rt === 4)) col = cOutline;
+      }
+      if (col >= 0 && !(cDither && ((sx + sy) & 1))) psetZ(sx, sy, col, cDepth);
+    }
+  }
+}
+function sonnetPose(front) {
+  cHi = SNH; cBody = SNB; cSh = SNS; cOutline = BLK; cSil = -1;
+  cLegA = sLegA; cLegB = sLegB; cArmL = sArmL; cArmR = sArmR; cSqW = sSqW; cSqH = sSqH;
+  cLean = sLean; cEyes = front || sEyes ? 1 : 0; cEyeDx = sEyeDx;
+}
+function drawMini(x, y, body, out) {             // 5x3 micro mascot for HUD markers
+  rectF(x - 1, y - 1, 7, 5, out);
+  rectF(x + 1, y, 3, 1, body); rectF(x, y + 1, 5, 1, body); pset(x + 1, y + 2, body); pset(x + 3, y + 2, body);
+}
+
+// =========================================================================
+//  WORLD OBJECTS
+// =========================================================================
+function drawRock(cx, cy, r, z, kind, t) {
+  if (r < 1) { psetZ(cx, cy, ORG, z); psetZ(cx + 1, cy, YEL, z); return; }
+  if (r > 70) r = 70;
+  const lim = (r + 1) * (r + 1) * 1.2;
+  for (let dy = -r - 1; dy <= r + 1; dy++) {
+    for (let dx = -r - 1; dx <= r + 1; dx++) {
+      const d2 = dx * dx + dy * dy;
+      if (d2 > lim) continue;
+      const sector = ((Math.atan2(dy, dx) + Math.PI) * 2.546) | 0;
+      const rr2 = r * LUMP[(sector + kind * 5) & 15], d = Math.sqrt(d2);
+      if (d > rr2) continue;
+      let c;
+      if (d > rr2 - 1) c = RKD;
+      else {
+        const lit = (-dx - dy) / (r * 1.41), lead = (-dx + dy) / (r * 1.41);
+        if (lead > 0.6 && d > rr2 * 0.6) c = ((dx + dy + (t >> 1)) & 1) ? ORG : RED;
+        else c = lit > 0.35 ? RKL : (lit > -0.3 ? RKM : RKD);
+      }
+      psetZ(cx + dx, cy + dy, c, z);
+    }
+  }
+  if (r >= 3) {
+    const cr = CRACK[kind & 3], lava = (t >> 2) & 1 ? YEL : ORG;
+    for (let j = 0; j < cr.length; j += 4) {
+      lineZ(Math.round(cx + cr[j] * r), Math.round(cy + cr[j + 1] * r), Math.round(cx + cr[j + 2] * r), Math.round(cy + cr[j + 3] * r), lava, z - 0.05);
+    }
+  }
+}
+function drawWarnSign(x, y) {
+  for (let j = 0; j < 7; j++) for (let i = 0; i < 7; i++) {
+    const v = WARN_BMP[j * 7 + i];
+    if (v) pset(x + i, y + j, v === 1 ? YEL : BLK);
+  }
+}
+function drawMeteors(t) {
+  for (let i = 0; i < NM; i++) {
+    const tau = mTn[i] - t;
+    if (tau > mTau0[i] || tau <= mExpl[i]) continue;
+    meteorPos(i, t);
+    if (MZ <= NEAR) continue;
+    proj(MZ, MX, MY);
+    const cx = Math.round(PX), cy = Math.round(PY), r = Math.round(mSize[i] * PK);
+    drawRock(cx, cy, r, MZ, mKind[i], t);
+    if (tau > mTau0[i] - 44 && mDzOff[i] === 0 && ((t >> 2) & 1)) {
+      const wx = clamp(cx + r + 3, 1, W - 8), wy = clamp(cy - r - 8, 25, H - 8);
+      drawWarnSign(wx, wy);
+      if (mSize[i] > 3) drawWarnSign(clamp(wx + 8, 1, W - 8), wy);
+    }
+  }
+}
+function beamLine(sx, sy, ex, ey, th, z, t, head) {
+  let x0 = Math.round(sx), y0 = Math.round(sy);
+  const x1 = Math.round(ex), y1 = Math.round(ey);
+  let dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;
+  const stx = x0 < x1 ? 1 : -1, sty = y0 < y1 ? 1 : -1, n = dx > -dy ? dx : -dy;
+  let err = dx + dy, j = 0;
+  const top = -(th >> 1);
+  for (;;) {
+    let wob = 0;
+    if (head && n - j < 7) wob = WOB[(t + j) % 10];
+    for (let o = 0; o < th; o++) {
+      const rim = th >= 3 && (o === 0 || o === th - 1);
+      let c = rim ? CYA : WHT;
+      if (th === 2 && o === 1) c = CYA;
+      if (rim && ((x0 + t) & 7) === 0) c = WHT;
+      psetZ(x0, y0 + top + o + wob, c, z);
+    }
+    if ((x0 === x1 && y0 === y1) || ++j > 400) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += stx; }
+    if (e2 <= dx) { err += dx; y0 += sty; }
+  }
+  if (head) {                                         // hot tip
+    const hx = x1, hy = y1 + WOB[t % 10];
+    psetZ(hx, hy - 1, WHT, z - 0.1); psetZ(hx, hy + 1, WHT, z - 0.1); psetZ(hx + 1, hy, WHT, z - 0.1); psetZ(hx - 1, hy, WHT, z - 0.1);
+    psetZ(hx, hy, MAG, z - 0.1); psetZ(hx + ((t & 2) ? 2 : -2), hy + ((t & 4) ? 1 : -1), MAG, z - 0.1);
+  }
+}
+function drawBeams(t) {
+  for (let i = 0; i < NB; i++) {
+    if (t < bWarn[i] || t >= bEnd[i]) continue;
+    const dz = bS[i] - camS;
+    if (dz <= NEAR) continue;
+    const yr = yRoadRel(dz);
+    proj(dz, bXa[i], yr + bYa[i]); const ax = PX, ay = PY;
+    proj(dz, bXb[i], yr + bYb[i]); const bx = PX, by = PY, k = PK;
+    // emitter drone
+    const ex0 = bEmit[i] === 0 ? ax : bx, ey0 = bEmit[i] === 0 ? ay : by, ds = Math.max(1, Math.round(0.9 * k));
+    rectZ(Math.round(ex0) - ds, Math.round(ey0) - ds, Math.round(ex0) + ds, Math.round(ey0) + ds, RKD, dz + 0.2);
+    psetZ(Math.round(ex0), Math.round(ey0), (t >> 2) & 1 ? MAG : WHT, dz);
+    if (t < bFire[i]) {
+      if (((t - bWarn[i]) >> 2) & 1) continue;      // ~0.5 s of flashing 1px magenta preview
+      lineZ(Math.round(ax), Math.round(ay), Math.round(bx), Math.round(by), MAG, dz);
+    } else {
+      const ext = Math.min(1, (t - bFire[i] + 1) / 9);
+      const th = clamp(Math.round(0.75 * k), 1, 5);
+      if (bEmit[i] === 0) beamLine(ax, ay, ax + (bx - ax) * ext, ay + (by - ay) * ext, th, dz, t, true);
+      else beamLine(bx, by, bx + (ax - bx) * ext, by + (ay - by) * ext, th, dz, t, true);
+    }
+  }
+}
+function drawGates(t) {
+  // finish gate: checkered banner on two pillars
+  let dz = S_FIN - camS;
+  if (dz > NEAR && dz < 330) {
+    const yr = yRoadRel(dz);
+    proj(dz, -HALFW - 2.4, yr + 11); const lx0 = Math.round(PX), ty = Math.round(PY), k = PK;
+    proj(dz, HALFW + 2.4, yr - 3); const rx1 = Math.round(PX), by = Math.round(PY);
+    const pw = Math.max(1, Math.round(1.6 * k)), bannerB = ty + Math.max(2, Math.round(2.6 * k));
+    rectZ(lx0, ty, lx0 + pw, by, RKL, dz); rectZ(rx1 - pw, ty, rx1, by, RKL, dz);
+    rectZ(lx0 + pw, ty, lx0 + pw, by, RKM, dz); rectZ(rx1, ty, rx1, by, RKM, dz);
+    const cs = Math.max(1, Math.round(1.6 * k));
+    for (let y = ty; y <= bannerB; y++) for (let x = lx0; x <= rx1; x++) {
+      const cxk = Math.floor((x - lx0) / cs), cyk = Math.floor((y - ty) / cs);
+      psetZ(x, y, (cxk + cyk) & 1 ? BLK : WHT, dz - 0.05);
+    }
+    rectZ(lx0, bannerB + 1, rx1, bannerB + 1, YEL, dz - 0.05);
+  }
+  // warp portal: concentric rainbow rings
+  dz = S_WARP - camS;
+  if (dz > NEAR && dz < 330) {
+    proj(dz, 0, yRoadRel(dz) + 7);
+    const cx = Math.round(PX), cy = Math.round(PY), k = PK;
+    for (let j = 0; j < 7; j++) {
+      const r = Math.round((7 + j * 2.2) * k);
+      if (r > 220) continue;
+      circle(cx, cy, r, LANE[(j + (t >> 2)) % 7], dz);
+      if (k > 1.2) circle(cx, cy, r + 1, LANED[(j + (t >> 2)) % 7], dz);
+    }
+  }
+}
+function drawSonnetMain(t) {
+  sonVis = 0;
+  const dz = gapS[t];
+  // rainbow afterimages first (they stay where Sonnet was)
+  for (let k = 0; k < GN; k++) {
+    if (!gOn[k] || gDz[k] <= 1.6) continue;
+    proj(gDz[k], gX[k], yRoadRel(gDz[k]) + gH[k]);
+    if (PK * 12 > 300) continue;
+    cSil = gAge[k] < 8 ? LANE[gCol[k]] : LANED[gCol[k]];
+    cLegA = gLegA[k]; cLegB = gLegB[k]; cArmL = -1; cArmR = -1; cSqW = 0; cSqH = 0; cLean = 0; cEyes = 0;
+    cDepth = gDz[k] + 0.4; cDither = 1;
+    drawCharacter(PX, PY, PK);
+  }
+  cSil = -1; cDither = 0;
+  if (dz < 1.6) return;
+  proj(dz, xS[t], yRoadRel(dz) + AS.h[t]);
+  const k = PK;
+  if (k * 12 > 300) return;
+  sonnetPose(false);
+  cDepth = dz - 0.3;
+  const bob = sBob ? Math.max(1, Math.round(k * 0.5)) : 0;
+  drawCharacter(PX, PY - bob, k);
+  sonVis = 1; sonSX = PX; sonTop = PY - bob - (8 + sSqH) * k;
+}
+function drawWorldParticles() {
+  for (let i = 0; i < PN; i++) {
+    if (pLife[i] === 0) continue;
+    const sp = PT_SPACE[pType[i]];
+    if (sp === 0) continue;
+    const dz = pZ[i];
+    if (dz <= NEAR) continue;
+    proj(dz, pX[i], (sp === 1 ? yRoadRel(dz) : 0) + pY[i]);
+    const x = Math.round(PX), y = Math.round(PY), c = pColor(i);
+    psetZ(x, y, c, dz);
+    if (dz < 9 || (pType[i] === PT_FIRE && dz < 22)) { psetZ(x + 1, y, c, dz); psetZ(x, y + 1, c, dz); psetZ(x + 1, y + 1, c, dz); }
+  }
+}
+
+// =========================================================================
+//  OVERLAYS (screen space)
+// =========================================================================
+function brackets(x0, y0, x1, y1, c) {
+  pset(x0, y0, c); pset(x0 + 1, y0, c); pset(x0, y0 + 1, c);
+  pset(x1, y0, c); pset(x1 - 1, y0, c); pset(x1, y0 + 1, c);
+  pset(x0, y1, c); pset(x0 + 1, y1, c); pset(x0, y1 - 1, c);
+  pset(x1, y1, c); pset(x1 - 1, y1, c); pset(x1, y1 - 1, c);
+}
+function drawThinking(t) {
+  // ADAPTIVE THINKING: lock-on brackets, predicted paths and the planned move for each meteor
+  if (t >= T_THINK0 && t < T_THINK1) {
+    for (let i = 1; i <= 3; i++) {
+      const tau = mTn[i] - t;
+      if (tau > mTau0[i] || tau < 2) continue;
+      for (let s = 1; s <= 7; s++) {
+        const tf = t + s * 5 + ((t >> 1) & 3);
+        if (tf >= mTn[i]) break;
+        meteorPos(i, tf);
+        if (MZ <= NEAR) break;
+        proj(MZ, MX, MY);
+        pset(Math.round(PX), Math.round(PY), (s & 1) ? CYA : WHT);
+      }
+      meteorPos(i, t);
+      if (MZ <= NEAR) continue;
+      proj(MZ, MX, MY);
+      const cx = Math.round(PX), cy = Math.round(PY), r = Math.round(mSize[i] * PK) + 3;
+      const c = (t >> 2) & 1 ? CYA : WHT;
+      brackets(cx - r, cy - r, cx + r, cy + r, c);
+      const lab = i === 1 ? T_JUMP : (i === 2 ? T_SLIDE : T_DASH);
+      text(lab, clamp(cx - (TXT_W[lab] >> 1), 1, W - 1 - TXT_W[lab]), clamp(cy - r - 7, 25, H - 6), CYA, 1, BLK, 99);
+    }
+  }
+  // 1M CONTEXT: the remembered beam pattern appears before the real warning
+  if (t >= T_RECALL0 && t < T_RECALL1) {
+    const dz = bS[1] - camS;
+    if (dz > NEAR) {
+      const yr = yRoadRel(dz);
+      proj(dz, bXa[1], yr + bYa[1]); const ax = Math.round(PX), ay = Math.round(PY);
+      proj(dz, bXb[1], yr + bYb[1]); const bx = Math.round(PX), by = Math.round(PY);
+      const x0 = Math.max(1, ax), x1 = Math.min(W - 2, bx);
+      for (let x = x0; x <= x1; x++) if (((x + (t >> 1)) % 3) === 0) { pset(x, ay, (x >> 2) & 1 ? CYA : MAG); pset(x, ay + 1, NV1); }
+      const c = (t >> 2) & 1 ? CYA : WHT;
+      brackets(x0 - 2, ay - 3, x1 + 2, by + 3, c);
+      text(T_RECALL, 80 - (TXT_W[T_RECALL] >> 1), clamp(ay - 10, 26, 70), c, 1, BLK, 99);
+    }
+  }
+}
+function drawSonnetTag() {
+  if (!sonVis) return;
+  const tw = TXT_W[T_SONNET];
+  const x = clamp(Math.round(sonSX) - (tw >> 1), 1, W - 2 - tw), y = clamp(Math.round(sonTop) - 9, 26, 80);
+  text(T_SONNET, x, y, SNH, 1, BLK, 99);
+  const px = clamp(Math.round(sonSX), x + 2, x + tw - 2);
+  rectF(px - 1, y + 6, 3, 1, SNH); pset(px, y + 7, SNH);
+}
+function drawScreenParticles() {
+  for (let i = 0; i < PN; i++) {
+    if (pLife[i] === 0 || PT_SPACE[pType[i]] !== 0) continue;
+    const x = Math.round(pX[i]), y = Math.round(pY[i]), c = pColor(i);
+    if (pType[i] === PT_JDUST && pAge[i] >= 24 && pAge[i] < 92) pset(x + 1, y + 1, NV0);
+    pset(x, y, c);
+    if (pType[i] === PT_CONF && (pAge[i] & 4)) pset(x + 1, y, c);
+    if (pType[i] === PT_FLAME && pAge[i] < 12) { pset(x, y + 1, c); pset(x + 1, y, c); pset(x + 1, y + 1, c); }
+  }
+}
+function drawSpeedLines(t) {
+  const spd = vO[t] * 0.5;
+  let n = clamp(Math.round((spd - 0.7) * 26), 3, NSL);
+  if (boostOn(t) || state === ST_WARP) n = NSL;
+  const len = Math.round(6 + 14 * clamp(spd - 0.7, 0, 1.4));
+  for (let i = 0; i < n; i++) {
+    const a = slA[i], r = slR[i];
+    const x1 = Math.round(cxS + SL_C[a] * r * 1.25), y1 = Math.round(hY + SL_S[a] * r);
+    const x0 = Math.round(cxS + SL_C[a] * (r - len) * 1.25), y0 = Math.round(hY + SL_S[a] * (r - len));
+    lineF(x0, y0, x1, y1, (i & 1) ? STR : (auraLv > 0.5 && (i & 2) ? YEL : WHT));
+  }
+}
+function drawRing() {
+  if (ringT > 22) return;
+  for (let j = 0; j < 3; j++) {
+    const r = ringT * 6 - j * 6;
+    if (r > 2) circle(cxS, hY + 12, r, LANE[(ringT + j * 2) % 7], -1);
+  }
+}
+const ARM_W = 20, ARM_H = 15, ARM_D = 4, ARM_Y = 74;
+function aset(x, y, c, dith) { if (dith && ((x + y) & 1)) return; pset(x, y, c); }
+// one arm as a small 3D block: front face + top face + inner side face (receding to the centre)
+function armPaint(x, y, dir, cf, ch, cs, ct, csd, dith) {
+  for (let r = 1; r <= ARM_D; r++) for (let i = 0; i < ARM_W; i++) aset(x + i + r * dir, y - r, ct, dith);
+  for (let c = 1; c <= ARM_D; c++) {
+    const sx = dir > 0 ? x + ARM_W - 1 + c : x - c;
+    for (let j = 0; j < ARM_H; j++) aset(sx, y + j - c, csd, dith);
+  }
+  for (let j = 0; j < ARM_H; j++) for (let i = 0; i < ARM_W; i++) {
+    let c = cf;
+    if (j === 0 || i === 0) c = ch;
+    else if (j >= ARM_H - 2 || i === ARM_W - 1) c = cs;
+    aset(x + i, y + j, c, dith);
+  }
+}
+function armSolid(x, y, dir, c, dith) { armPaint(x, y, dir, c, c, c, c, c, dith); }
+function drawArm(x, y, dir, oc, aura, t) {
+  if (aura) {
+    const ac = (t >> 1) & 1 ? YEL : ((t >> 2) & 1 ? WHT : ORG);
+    armSolid(x - 2, y, dir, ac, 0); armSolid(x + 2, y, dir, ac, 0); armSolid(x, y - 2, dir, ac, 0); armSolid(x, y + 2, dir, ac, 0);
+  }
+  armSolid(x - 1, y, dir, oc, 0); armSolid(x + 1, y, dir, oc, 0); armSolid(x, y - 1, dir, oc, 0); armSolid(x, y + 1, dir, oc, 0);
+  armPaint(x, y, dir, OPB, OPH, OPS, OPH, dir > 0 ? OPS : OPB, 0);
+}
+function drawArms(t) {
+  const lx = -7 + pArmDx, rx = W + 7 - ARM_W - pArmDx;
+  const ly = ARM_Y + pArmL, ry = ARM_Y + pArmR;
+  let rxb = rx;
+  if (bumpT < 10) rxb = rx - (bumpWho === 0 ? 4 : -3);
+  // rainbow afterimages of the arms during a dash (red, orange, yellow, green → dark), dithered
+  if (ghostT < 16) {
+    for (let g = 4; g >= 1; g--) {
+      const off = -ghostDir * g * 4, c = ghostT < 8 ? LANE[g - 1] : LANED[g - 1];
+      armSolid(lx + off, ly + (g >> 1), 1, c, 1);
+      armSolid(rxb + off, ry + (g >> 1), -1, c, 1);
+    }
+  }
+  const aura = auraLv > 0.3;
+  const ocL = nmT > 0 && (nmSide === 1 || nmSide >= 2) ? WHT : BLK;
+  const ocR = nmT > 0 && (nmSide === 0 || nmSide >= 2) ? WHT : BLK;
+  drawArm(lx, ly, 1, ocL, aura, t);
+  drawArm(rxb, ry, -1, ocR, aura, t);
+}
+function drawEdgeFlash(t) {
+  if (nmT > 0 && (nmT & 2)) {
+    if (nmSide === 0) rectF(W - 1, 0, 1, H, WHT);
+    else if (nmSide === 1) rectF(0, 0, 1, H, WHT);
+    else if (nmSide === 2) rectF(0, 0, W, 1, WHT);
+    else rectF(0, H - 1, W, 1, WHT);
+  }
+  if (auraLv > 0.3) {                               // dithered aura glow around the whole view
+    const c = (t >> 2) & 1 ? YEL : ORG;
+    for (let x = 0; x < W; x++) { if (((x + (t >> 1)) & 3) === 0) { pset(x, H - 1, c); pset(x, H - 2, ORG); } }
+    for (let y = 30; y < H; y++) { if (((y + (t >> 1)) & 3) === 0) { pset(0, y, c); pset(W - 1, y, c); } }
+  }
+  if (finFlash > 0) rectF(0, 0, W, H, WHT);
+}
+
+// =========================================================================
+//  HUD: nameplate, rear-view mirror, position, progress, skill callouts
+// =========================================================================
+function drawMirror(t) {
+  setClip(MX0, MY0, MX1, MY1); useZ = false;
+  for (let y = MY0; y <= MY1; y++) {
+    const c = y < MHY - 3 ? BLK : (y < MHY ? NV0 : (y === MHY ? NV2 : NV1));
+    rectF(MX0, y, MW, 1, c);
+  }
+  for (let i = 0; i < 9; i++) pset(MX0 + 3 + ((i * 23 + (roadXd0 * 20 | 0)) % (MW - 6)), MY0 + 1 + (i * 5) % 5, i & 1 ? STR : NV2);
+  for (let y = MHY + 1; y <= MY1; y++) {
+    const d = camAbove * FM / (y - MHY + 0.5);
+    if (isGap(camS - d - 0.5, camS - d + 0.5)) continue;
+    const k = FM / d, xc = MCX + (xRoadRelB(d) - camX) * k, w = HALFW * k;
+    const seg = Math.floor((camS - d) / SEG), dark = ((seg % 6) + 6) % 6 === 0;
+    for (let l = 0; l < 7; l++) {
+      const a = Math.round(xc - w + 2 * w * l / 7), b = Math.round(xc - w + 2 * w * (l + 1) / 7) - 1;
+      for (let x = a; x <= b; x++) pset(x, y, dark ? LANED[l] : LANE[l]);
+    }
+  }
+  // meteors and particles behind us
+  for (let i = 0; i < NM; i++) {
+    const tau = mTn[i] - t;
+    if (tau > 0 || tau <= mExpl[i] || tau < -70) continue;
+    meteorPos(i, t);
+    if (MZ > -2) continue;
+    projM(-MZ, MX, MY);
+    const r = Math.max(1, Math.round(mSize[i] * PK));
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (dx * dx + dy * dy <= r * r) pset(Math.round(PX) + dx, Math.round(PY) + dy, dx + dy < 0 ? RKL : RKM);
+  }
+  for (let i = 0; i < PN; i++) {
+    if (pLife[i] === 0) continue;
+    const sp = PT_SPACE[pType[i]];
+    if (sp === 0 || pZ[i] > -2) continue;
+    const d = -pZ[i];
+    projM(d, pX[i], (sp === 1 ? yRoadRelB(d) : 0) + pY[i]);
+    pset(Math.round(PX), Math.round(PY), pColor(i));
+  }
+  // Sonnet chasing (front view: eyes on you)
+  const g = gapS[t];
+  if (g < -1.6) {
+    const d = -g;
+    projM(d, xS[t], yRoadRelB(d) + AS.h[t]);
+    const k = PK;
+    if (k * 12 >= 5) {
+      sonnetPose(true); cDepth = 0;
+      drawCharacter(PX, PY, k);
+    } else drawMini(Math.round(PX) - 2, Math.round(PY) - 3, SNB, BLK);
+    mirSX = PX; mirTop = PY - 8 * Math.max(k, 0.4);
+    const tw = TXT_W[T_SONNET];
+    text(T_SONNET, clamp(Math.round(mirSX) - (tw >> 1), MX0 + 1, MX1 - tw), clamp(Math.round(mirTop) - 6, MY0 + 1, MY1 - 5), SNH, 1, BLK, 99);
+  }
+  resetClip(); useZ = true;
+  // frame
+  rectF(MX0 - 2, MY0 - 2, MW + 4, 1, BLK); rectF(MX0 - 2, MY1 + 2, MW + 4, 1, BLK);
+  rectF(MX0 - 2, MY0 - 2, 1, MH + 4, BLK); rectF(MX1 + 2, MY0 - 2, 1, MH + 4, BLK);
+  rectF(MX0 - 1, MY0 - 1, MW + 2, 1, RKL); rectF(MX0 - 1, MY0 - 1, 1, MH + 2, RKM);
+  rectF(MX0 - 1, MY1 + 1, MW + 2, 1, RKD); rectF(MX1 + 1, MY0 - 1, 1, MH + 2, RKD);
+  pset(MX0 - 2, MY0 - 2, NV0); pset(MX1 + 2, MY0 - 2, NV0); pset(MX0 - 2, MY1 + 2, NV0); pset(MX1 + 2, MY1 + 2, NV0);
+}
+function drawCallout(t) {
+  if (calIdx < 0) return;
+  const owner = C_DEF[calIdx * 3 + 1], id = C_DEF[calIdx * 3 + 2];
+  const nameId = owner === 0 ? T_OPUS : T_SONNET;
+  const bw = 20 + Math.max(TXT_W[nameId], TXT_W[id]) + 6, bh = 15, y = 72;
+  let slide = 0;
+  if (calT < 8) slide = 1 - ease(2, calT / 8);
+  else if (calT > 92) slide = ease(3, (calT - 92) / 8);
+  const off = Math.round(slide * (bw + 4));
+  const x = Math.round(owner === 0 ? 19 - off - 20 * slide : 141 - bw + off + 20 * slide);
+  const hi = owner === 0 ? OPH : SNH, body = owner === 0 ? OPB : SNB;
+  rectF(x, y, bw, bh, BLK);
+  rectF(x, y, bw, 1, body); rectF(x, y + bh - 1, bw, 1, body);
+  if (owner === 0) rectF(x, y, 2, bh, hi); else rectF(x + bw - 2, y, 2, bh, hi);
+  // portrait: the mascot itself, eyes forward
+  cHi = hi; cBody = body; cSh = owner === 0 ? OPS : SNS; cOutline = -1; cSil = -1;
+  cLegA = 0; cLegB = 0; cArmL = (calT >> 3) & 1 ? -1 : 0; cArmR = 0; cSqW = 0; cSqH = 0; cLean = 0; cEyes = 1; cEyeDx = 0;
+  useZ = false;
+  drawCharacter(x + (owner === 0 ? 10 : 9), y + 12, 1);
+  useZ = true; cOutline = BLK;
+  const tx = x + (owner === 0 ? 19 : 18);
+  text(nameId, tx, y + 2, hi, 1, -1, 99);
+  const reveal = calT < 6 ? 0 : (calT - 6);
+  glyphs(id, tx, y + 8, (calT >> 2) & 1 && calT < 30 ? YEL : WHT, 1, reveal);
+}
+function drawHUD(t) {
+  // nameplate above "your" head
+  const nw = TXT_W[T_OPUS], nx = 80 - (nw >> 1);
+  let nc = OPH;
+  if (auraLv > 0.3) nc = (t >> 2) & 1 ? YEL : WHT;
+  text(T_OPUS, nx, 1, nc, 1, BLK, 99);
+  for (let s = 0; s < 2; s++) {                        // little ▼ markers
+    const px = s ? nx + nw + 3 : nx - 5;
+    rectF(px, 2, 3, 1, nc); pset(px + 1, 3, nc);
+  }
+  drawMirror(t);
+  // position
+  const pid = posNow === 1 ? T_1ST : T_2ND;
+  const pc = posFlash > 0 && (posFlash & 4) ? WHT : (posNow === 1 ? YEL : STR);
+  text(pid, 3, 3, pc, 2, BLK, 99);
+  // progress to the finish line
+  const x0 = 117, x1 = 150;
+  rectF(x0 - 1, 4, x1 - x0 + 3, 3, BLK); rectF(x0, 5, x1 - x0 + 1, 1, NV2);
+  for (let x = x0; x <= x1; x += 8) pset(x, 5, STR);
+  rectF(152, 1, 1, 8, RKL);
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 4; i++) pset(153 + i, 1 + j, (i + j) & 1 ? BLK : WHT);
+  const po = clamp(sO[t] / S_FIN, 0, 1), ps = clamp((sO[t] + gapS[t]) / S_FIN, 0, 1);
+  drawMini(Math.round(x0 + ps * (x1 - x0)) - 2, 1, SNB, BLK);
+  drawMini(Math.round(x0 + po * (x1 - x0)) - 2, 7, OPB, BLK);
+  drawCallout(t);
+}
+function drawBigTexts(t) {
+  if (bigId >= 0) {
+    const sc = 2, w = TXT_W[bigId] * sc;
+    const drop = bigT < 6 ? (6 - bigT) : 0;
+    const y = (bigId === T_WINNER ? 43 : 46) - drop;
+    if (!(bigT > 56 && bigId !== T_WINNER && (bigT & 2))) text(bigId, 80 - (w >> 1), y, bigCol, sc, BLK, 99);
+    if (bigId === T_WINNER && bigT > 14) {
+      const w2 = TXT_W[T_OPUS] * 2;
+      text(T_OPUS, 80 - (w2 >> 1), 57, (t >> 3) & 1 ? OPH : WHT, 2, BLK, 99);
+    }
+  }
+  if (nmTextT > 0) {
+    const w = TXT_W[T_NEAR];
+    let x = 80 - (w >> 1), y = 63;
+    if (nmTextSide === 0) { x = W - 4 - w; y = 52; }
+    else if (nmTextSide === 1) { x = 4; y = 52; }
+    text(T_NEAR, x, y - (nmTextT > 38 ? nmTextT - 38 : 0), (nmTextT >> 2) & 1 ? WHT : YEL, 1, BLK, 99);
+  }
+}
+function drawWarpOverlay(t) {
+  let cover = -1, rainbow = false;
+  if (t >= T_FLASH0) {
+    const k = t - T_FLASH0;
+    if (k < 10) cover = Math.round(k * 1.7);
+    else if (k < 18) cover = 16;
+    else { cover = 16; rainbow = true; }
+  } else if (t < T_DISSOLVE) { cover = 16 - Math.floor(t * 16 / T_DISSOLVE); rainbow = true; t += T_END; }
+  if (cover <= 0) return;
+  for (let y = 0; y < H; y++) {
+    const bo = (y & 3) * 4;
+    for (let x = 0; x < W; x++) {
+      if (BAYER[bo + (x & 3)] >= cover) continue;
+      fb[y * W + x] = rainbow ? LANE[(((x + y * 2 + t * 3) / 11) | 0) % 7] : WHT;
+    }
+  }
+}
+
+// =========================================================================
+//  PRESENT + MAIN LOOP (fixed 60 Hz simulation, rAF rendering)
+// =========================================================================
+const screenEl = document.getElementById("screen");
+const ctx = screenEl.getContext("2d", { alpha: false });
+const off = document.createElement("canvas");
+off.width = W; off.height = H;
+const octx = off.getContext("2d");
+const img = octx.createImageData(W, H);
+const img32 = new Uint32Array(img.data.buffer);
+let scale = 1, offX = 0, offY = 0, dirty = true;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.max(1, Math.round(window.innerWidth * dpr)), ch = Math.max(1, Math.round(window.innerHeight * dpr));
+  screenEl.width = cw; screenEl.height = ch;
+  scale = Math.max(1, Math.floor(Math.min(cw / W, ch / H)));   // largest integer multiple that fits
+  offX = (cw - W * scale) >> 1; offY = (ch - H * scale) >> 1;
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, cw, ch);
+  dirty = true;
+}
+function render() {
+  const t = tick;
+  computeView(t);
+  zb.fill(ZINF);
+  useZ = true; resetClip();
+  drawBackground(t);
+  drawRoad();
+  drawGates(t);
+  drawBeams(t);
+  drawMeteors(t);
+  drawSonnetMain(t);
+  drawWorldParticles();
+  drawSonnetTag();
+  drawThinking(t);
+  drawScreenParticles();
+  drawSpeedLines(t);
+  drawRing();
+  drawArms(t);
+  drawEdgeFlash(t);
+  drawHUD(t);
+  drawBigTexts(t);
+  drawWarpOverlay(t);
+  for (let i = 0; i < NPX; i++) img32[i] = pal32[fb[i]];
+  octx.putImageData(img, 0, 0);
+  ctx.drawImage(off, offX, offY, W * scale, H * scale);
+}
+function realTick() {
+  if (freezeLeft > 0) { freezeLeft--; return; }          // hit stop: everything holds
+  if (slowLeft > 0) {                                     // slow motion: thin out sim steps
+    slowLeft--;
+    slowPhase = slowPhase === 2 ? 0 : slowPhase + 1;
+    if (slowPhase !== 0) return;
+  }
+  simStep();
+  computeView(tick);
+  dirty = true;
+}
+const STEP = 1000 / TPS;
+let last = -1, acc = 0;
+function frame(now) {
+  if (last < 0) last = now;
+  let dt = now - last;
+  last = now;
+  if (dt > 250) dt = 250;
+  acc += dt;
+  let n = 0;
+  while (acc >= STEP && n < 8) { realTick(); acc -= STEP; n++; }
+  if (n === 8) acc = 0;
+  if (dirty) { render(); dirty = false; }
+  requestAnimationFrame(frame);
+}
+resetLoop();
+computeView(0);
+resize();
+window.addEventListener("resize", resize);
+requestAnimationFrame(frame);
+// tiny inspection hook (used for automated checks; harmless otherwise)
+window.__rainbowRun = {
+  T: T_END, tps: TPS,
+  seek(s) { resetLoop(); const n = Math.round(s * TPS); for (let i = 0; i < n; i++) { simStep(); computeView(tick); } render(); dirty = false; },
+  step(n) { for (let i = 0; i < n; i++) { simStep(); computeView(tick); } render(); dirty = false; },
+  get tick() { return tick; },
+  get state() { return state; },
+  get pos() { return posNow; },
+  render,
+  fb, PAL_HEX
+};
+})();
+</script>
+</body>
+</html>
